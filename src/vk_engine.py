@@ -7,6 +7,7 @@ import os, sys, time, numpy as np, vulkan as vk, torch
 ffi = vk.ffi
 FP8 = os.environ.get("GEMV_FP8") == "1"  # A/B: fp8 e4m3 per-block scales (half scale traffic) vs fp16
 PREFILL_I8 = os.environ.get("PREFILL_I8") == "1"  # W8A8 int8 coopmat prefill GEMM (~2x prefill, +12GB weights)
+REPEAT_LIMIT = int(os.environ.get("GEMMA4_REPEAT_LIMIT", "32"))  # escape degenerate <=4-token loops (0=off)
 NGEN = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 6  # robust to importers
 BLK = 32; WIN = 1024; CTX = 65536; MAXT = CTX; MODEL = "models/gemma-4-12B-it"
 # 64k context: global (full) layers keep a CTX-deep KV; sliding layers keep only a WIN-deep ring
@@ -512,6 +513,18 @@ def sample(logits, temperature=0.0, top_p=1.0):
     return int(np.random.choice(p.shape[0], p=p))
 
 
+def _loop_tail(buf, limit):
+    """Degeneration guard: True if the tail of `buf` is a period<=4 token cycle covering >= `limit`
+    tokens (e.g. runaway '\\t\\t\\t...', '000...', repeated <|image>). Stops the model spewing junk
+    to max_tokens. buf holds the most recent token last."""
+    m = len(buf)
+    for p in range(1, 5):
+        if m < limit or m < 2 * p: continue
+        unit = buf[m - p:]
+        if all(buf[m - p * (i + 1):m - p * i] == unit for i in range(1, limit // p + 1)):
+            return True
+    return False
+
 def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_chunks=0, snap_chunks=0):
     """Prefill `ids` then yield generated token ids one at a time (greedy or sampled).
     Prefix KV cache: `reuse_chunks` skips the first N prefill chunks (their KV is restored from the
@@ -528,11 +541,15 @@ def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_ch
         if c + 1 == snap_chunks: _kv_copy(_cb_snap)            # snapshot the shared-prefix KV
     logits = None
     for pos in range(nfull * MC, n): logits = forward(ids[pos], pos)           # tail + last via decode
-    pos = n
+    pos = n; recent = []
     for _ in range(max_new):
         nxt = sample(logits, temperature, top_p)
         if nxt in stop_ids: return
         yield nxt
+        if REPEAT_LIMIT:                                    # escape degenerate token loops
+            recent.append(nxt)
+            if len(recent) > REPEAT_LIMIT + 8: recent = recent[-(REPEAT_LIMIT + 8):]
+            if _loop_tail(recent, REPEAT_LIMIT): return
         if pos >= MAXT - 1: return
         logits = forward(nxt, pos); pos += 1
 
