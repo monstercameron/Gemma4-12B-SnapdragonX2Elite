@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+// Per-row int8 quantizer for W8A8 prefill: one workgroup per row m, absmax-reduce over K, write int8
+// activations + per-row scale s_a[m]=absmax/127. Pairs with coopgemm_w8a8 (which rescales by s_a*s_w).
+layout(local_size_x = 256) in;
+layout(std430, binding=0) readonly  buffer S  { float  src[]; };   // [M,K] f32 activations
+layout(std430, binding=1) writeonly buffer D  { int8_t dst[]; };   // [M,K] int8
+layout(std430, binding=2) writeonly buffer SA { float  sa[]; };    // [M] per-row scale
+layout(std140, binding=3) uniform U { uvec4 d; };   // K,0,0,0
+shared float red[256];
+void main() {
+  uint m = gl_WorkGroupID.x; uint K = d.x; uint t = gl_LocalInvocationID.x; uint base = m * K;
+  float mx = 0.0; for (uint i = t; i < K; i += 256u) { mx = max(mx, abs(src[base + i])); }
+  red[t] = mx; barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) { red[t] = max(red[t], red[t + st]); } barrier(); }
+  float s = max(red[0] / 127.0, 1e-12); float inv = 1.0 / s;
+  if (t == 0u) sa[m] = s;
+  for (uint i = t; i < K; i += 256u) { dst[base + i] = int8_t(clamp(int(round(src[base + i] * inv)), -127, 127)); }
+}

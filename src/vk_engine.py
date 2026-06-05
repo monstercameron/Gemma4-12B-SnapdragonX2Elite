@@ -6,6 +6,7 @@ Run: .venv-gemma4/Scripts/python.exe scripts/vk_engine.py [ngen]
 import os, sys, time, numpy as np, vulkan as vk, torch
 ffi = vk.ffi
 FP8 = os.environ.get("GEMV_FP8") == "1"  # A/B: fp8 e4m3 per-block scales (half scale traffic) vs fp16
+PREFILL_I8 = os.environ.get("PREFILL_I8") == "1"  # W8A8 int8 coopmat prefill GEMM (~2x prefill, +12GB weights)
 NGEN = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 6  # robust to importers
 BLK = 32; WIN = 1024; CTX = 65536; MAXT = CTX; MODEL = "models/gemma-4-12B-it"
 # 64k context: global (full) layers keep a CTX-deep KV; sliding layers keep only a WIN-deep ring
@@ -22,14 +23,15 @@ qfi = next(i for i, q in enumerate(vk.vkGetPhysicalDeviceQueueFamilyProperties(p
            if q.queueFlags & vk.VK_QUEUE_COMPUTE_BIT)
 # enable cooperative-matrix + memory-model features (for the fp32 coopmat prefill GEMM); additive,
 # decode path is unaffected. Structs kept module-level so the pNext chain stays alive.
-_F16 = vk.VkPhysicalDeviceShaderFloat16Int8Features(shaderFloat16=vk.VK_TRUE)
-_ST16 = vk.VkPhysicalDevice16BitStorageFeatures(storageBuffer16BitAccess=vk.VK_TRUE, pNext=ffi.addressof(_F16))
+_F16 = vk.VkPhysicalDeviceShaderFloat16Int8Features(shaderFloat16=vk.VK_TRUE, shaderInt8=vk.VK_TRUE)
+_ST8 = vk.VkPhysicalDevice8BitStorageFeatures(storageBuffer8BitAccess=vk.VK_TRUE, pNext=ffi.addressof(_F16))
+_ST16 = vk.VkPhysicalDevice16BitStorageFeatures(storageBuffer16BitAccess=vk.VK_TRUE, pNext=ffi.addressof(_ST8))
 _COOPF = vk.VkPhysicalDeviceVulkanMemoryModelFeatures(vulkanMemoryModel=vk.VK_TRUE, pNext=ffi.addressof(_ST16))
 _COOPC = vk.VkPhysicalDeviceCooperativeMatrixFeaturesKHR(cooperativeMatrix=vk.VK_TRUE, pNext=ffi.addressof(_COOPF))
 dev = vk.vkCreateDevice(pdev, vk.VkDeviceCreateInfo(pNext=ffi.addressof(_COOPC), pQueueCreateInfos=[
     vk.VkDeviceQueueCreateInfo(queueFamilyIndex=qfi, pQueuePriorities=[1.0])],
     ppEnabledExtensionNames=["VK_KHR_cooperative_matrix", "VK_KHR_vulkan_memory_model",
-                             "VK_KHR_16bit_storage", "VK_KHR_shader_float16_int8"]), None)
+                             "VK_KHR_16bit_storage", "VK_KHR_8bit_storage", "VK_KHR_shader_float16_int8"]), None)
 queue = vk.vkGetDeviceQueue(dev, qfi, 0)
 PROFILE = os.environ.get("PROFILE") == "1"   # GPU timestamp profiling of the decode token graph
 PREPROF = os.environ.get("PREPROF") == "1"   # GPU timestamp profiling of the batched-prefill graph
@@ -96,6 +98,10 @@ P_pat, _ = pipe(spv("pre_attn.spv"), LA)
 P_cgemm16, PLcg = pipe(spv("coopgemm_i4h.spv"), LG)  # fp16 int4 coopmat GEMM (matrix cores) for prefill
 P_castdn, PLca = pipe(spv("cast_dn.spv"), LR)       # f32->f16 (LR = 2 storage + 1 uniform)
 P_castup, _ = pipe(spv("cast_up.spv"), LR)          # f16->f32
+if PREFILL_I8:                                       # W8A8 int8 coopmat prefill GEMM (~2x prefill)
+    L5 = layout(5, 1)
+    P_qi8, PLqi8 = pipe(spv("cast_i8.spv"), LN)     # f32 act -> int8 + per-row scale (3 storage + 1 uniform)
+    P_w8a8, PLw8 = pipe(spv("coopgemm_w8a8.spv"), L5)  # int8 act x int8 weight -> f16 (rescaled)
 
 # descriptor pool (generous)
 pool = vk.vkCreateDescriptorPool(dev, vk.VkDescriptorPoolCreateInfo(maxSets=4000, pPoolSizes=[
@@ -114,7 +120,7 @@ def ds(lay, stor, unif):  # entries: (buf,size) or (buf,size,offset)
     vk.vkUpdateDescriptorSets(dev, len(w), w, 0, None); return s
 
 # ---------- int4 quant ----------
-def quant(W):  # [N,K] -> wpack buf, scales buf, split
+def quant(W, pf=True):  # [N,K] -> wpack buf, scales buf, split
     N, K = W.shape; nblk = K // BLK
     Wb = W.reshape(N, nblk, BLK); sc = np.maximum(np.abs(Wb).max(2) / 7.0, 1e-8).astype(np.float32)
     q = np.clip(np.round(Wb / sc[:, :, None]) + 8, 0, 15).astype(np.uint8).reshape(N, K)
@@ -140,7 +146,15 @@ def quant(W):  # [N,K] -> wpack buf, scales buf, split
     split = min(divs, key=lambda s: (abs(s - want), s))
     bw = Buf(wp.nbytes); bw.write(wp.reshape(-1)); bs = Buf(scb.nbytes); bs.write(scb)
     bs16 = bs if not FP8 else (lambda b: (b.write(scb16), b)[1])(Buf(scb16.nbytes))  # prefill keeps fp16 scales
-    return bw, bs, split, nblk, inv, bs16
+    w8 = sw8 = None
+    if PREFILL_I8 and pf:   # precompute int8 weights [K,N] + per-column scale s_w (W8A8 prefill GEMM)
+        deqW = (q.astype(np.float32) - 8.0) * np.repeat(sc, BLK, axis=1)            # [N,K] int4-dequant
+        s_w = np.maximum(np.abs(deqW).max(1) / 127.0, 1e-12).astype(np.float32)     # [N]
+        Wi8T = np.ascontiguousarray(np.clip(np.round(deqW / s_w[:, None]), -127, 127).astype(np.int8).T)  # [K,N]
+        w8 = Buf(Wi8T.nbytes); w8.write(Wi8T.reshape(-1))
+        sw16 = s_w.astype(np.float16); sw8 = Buf(sw16.nbytes); sw8.write(sw16)
+        del deqW, Wi8T
+    return bw, bs, split, nblk, inv, bs16, w8, sw8
 
 # ---------- load model ----------
 import transformers
@@ -167,7 +181,7 @@ _dyn = np.zeros(4, np.uint32)                # reused per-token DYN scratch (no 
 cosb = {"sliding_attention": fb(256), "full_attention": fb(512)}
 sinb = {"sliding_attention": fb(256), "full_attention": fb(512)}
 DYN = buf_u32([0, 0, 0, 0])
-def i4(lin): W = lin.weight.detach().float().cpu().numpy(); lin.weight = None; return quant(W), W.shape
+def i4(lin, pf=True): W = lin.weight.detach().float().cpu().numpy(); lin.weight = None; return quant(W, pf), W.shape
 
 layers = []
 for li, L in enumerate(tm.layers):
@@ -190,13 +204,13 @@ for li, L in enumerate(tm.layers):
              kc=Buf(nkv * stride * hd * 2), vc=Buf(nkv * stride * hd * 2))   # fp16 KV cache (half traffic + 2x ctx capacity)
     layers.append(d)
     if (li + 1) % 16 == 0: print(f"  layer {li+1}/48 ({time.time()-t0:.0f}s)", flush=True)
-lmh = i4(model.lm_head); finw = wbuf(tm.norm.weight.detach().float().numpy())
+lmh = i4(model.lm_head, pf=False); finw = wbuf(tm.norm.weight.detach().float().numpy())  # lm_head is decode-only (no int8)
 print(f"[load] done {time.time()-t0:.0f}s; building command buffer...", flush=True)
 
 # ---------- descriptor sets + command recording ----------
 DUH = buf_u32([H, 0, 0, 0]); DUI = buf_u32([I, 0, 0, 0])
 def gemv_ds(qw, inbuf, outbuf, out_off=0):
-    (bw, bs, split, nblk, inv, _bs16), (N, K) = qw
+    (bw, bs, split, nblk, inv, _bs16, _w8, _sw8), (N, K) = qw
     # uniform: d=(N,nb8,bpc,blk); for fp8 also e.x=floatBits(inv) -> 8 u32, else 4. Same LG layout (range differs).
     du = [N, N // 8, nblk // split, BLK] + ([int(np.float32(inv).view(np.uint32)), 0, 0, 0] if FP8 else [])
     d1 = buf_u32(du); usz = 32 if FP8 else 16
@@ -317,14 +331,23 @@ Xp = fb(MC * H); Np = fb(MC * H); Tp = fb(MC * H)
 Qp = fb(MC * nqM); Ap = fb(MC * nqM); Kp = fb(MC * nkM); Vp = fb(MC * nkM)
 Gp = fb(MC * I); Upp = fb(MC * I); ACp = fb(MC * I)
 Xf16 = Buf(MC * I * 2); Yf16 = Buf(MC * I * 2)   # fp16 GEMM staging (max dim = I); reused per GEMM
+if PREFILL_I8:
+    Ai8 = Buf(MC * I); SAb = Buf(MC * 4)         # int8 activation staging + per-row scale; reused per GEMM
 cosMp = {"sliding_attention": fb(MC * 256), "full_attention": fb(MC * 512)}
 sinMp = {"sliding_attention": fb(MC * 256), "full_attention": fb(MC * 512)}
 DYNP = buf_u32([0, MC, 0, 0]); DUIp = buf_u32([MC * I, 0, 0, 0])
 
 def gemm_ds(qw, inbuf, outbuf):
     # fp16 coopmat GEMM: cast inbuf f32->f16 (Xf16), fp16 GEMM -> Yf16, cast Yf16 f16->f32 (outbuf).
-    (bw, _bs, _s, _n, _inv, bs16), (N, K) = qw  # prefill coopmat reads fp16 scales (bs16)
-    u = buf_u32([N, K, MC, N // 8]); uin = buf_u32([MC * K, 0, 0, 0]); uout = buf_u32([MC * N, 0, 0, 0])
+    (bw, _bs, _s, _n, _inv, bs16, w8, sw8), (N, K) = qw  # prefill coopmat reads fp16 scales (bs16)
+    uout = buf_u32([MC * N, 0, 0, 0])
+    if PREFILL_I8:   # W8A8: quant act f32->int8 (per row), int8 coopmat GEMM -> Yf16, cast Yf16->outbuf
+        uk = buf_u32([K, 0, 0, 0]); umnk = buf_u32([MC, N, K, 0])
+        cin = ds(LN, [(inbuf.buf, MC * K * 4), (Ai8.buf, MC * K), (SAb.buf, MC * 4)], [(uk.buf, 16)])
+        gem = ds(L5, [(Ai8.buf, MC * K), (w8.buf, w8.size), (SAb.buf, MC * 4), (sw8.buf, sw8.size), (Yf16.buf, MC * N * 2)], [(umnk.buf, 16)])
+        cout = ds(LR, [(Yf16.buf, MC * N * 2), (outbuf.buf, MC * N * 4)], [(uout.buf, 16)])
+        return (cin, gem, cout, N, K)
+    u = buf_u32([N, K, MC, N // 8]); uin = buf_u32([MC * K, 0, 0, 0])
     cin = ds(LR, [(inbuf.buf, MC * K * 4), (Xf16.buf, MC * K * 2)], [(uin.buf, 16)])
     gem = ds(LG, [(Xf16.buf, MC * K * 2), (bw.buf, bw.size), (bs16.buf, bs16.size), (Yf16.buf, MC * N * 2)], [(u.buf, 16)])
     cout = ds(LR, [(Yf16.buf, MC * N * 2), (outbuf.buf, MC * N * 4)], [(uout.buf, 16)])
@@ -354,8 +377,13 @@ def gd(C, pp, pl, dset, gx, gy=1):
     vk.vkCmdBindPipeline(C, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pp)
     vk.vkCmdBindDescriptorSets(C, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [dset], 0, None)
     vk.vkCmdDispatch(C, gx, gy, 1); vk.vkCmdPipelineBarrier(C, CS, CS, 0, 1, [MB], 0, None, 0, None)
-def gmm(C, t, L=None, tag=""):   # fp16 coopmat: cast-down -> GEMM (grid N/64 x M/64) -> cast-up
+def gmm(C, t, L=None, tag=""):   # coopmat GEMM: down-cast -> GEMM (grid N/64 x M/64) -> up-cast
     cin, gem, cout, N, K = t
+    if PREFILL_I8:   # W8A8: quant act->int8 (MC row-WGs) -> int8 GEMM -> cast Yf16->f32
+        gd(C, P_qi8, PLqi8, cin, MC);                  tsp(C, L, "cast")
+        gd(C, P_w8a8, PLw8, gem, N // 64, MC // 64);   tsp(C, L, tag + "_mm")
+        gd(C, P_castup, PLca, cout, (MC * N + 63) // 64); tsp(C, L, "cast")
+        return
     gd(C, P_castdn, PLca, cin, (MC * K + 63) // 64);   tsp(C, L, "cast")
     gd(C, P_cgemm16, PLcg, gem, N // 64, MC // 64);    tsp(C, L, tag + "_mm")
     gd(C, P_castup, PLca, cout, (MC * N + 63) // 64);  tsp(C, L, "cast")
