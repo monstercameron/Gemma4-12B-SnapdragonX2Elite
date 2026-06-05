@@ -32,10 +32,15 @@ dev = vk.vkCreateDevice(pdev, vk.VkDeviceCreateInfo(pNext=ffi.addressof(_COOPC),
                              "VK_KHR_16bit_storage", "VK_KHR_shader_float16_int8"]), None)
 queue = vk.vkGetDeviceQueue(dev, qfi, 0)
 PROFILE = os.environ.get("PROFILE") == "1"   # GPU timestamp profiling of the decode token graph
+PREPROF = os.environ.get("PREPROF") == "1"   # GPU timestamp profiling of the batched-prefill graph
 if PROFILE:
     _tsp = vk.vkGetPhysicalDeviceProperties(pdev).limits.timestampPeriod
     _qpool = vk.vkCreateQueryPool(dev, vk.VkQueryPoolCreateInfo(queryType=vk.VK_QUERY_TYPE_TIMESTAMP, queryCount=2048), None)
     _tslab = []; _agg = {}; _runs = [0]
+if PREPROF:
+    _tsp_pre = vk.vkGetPhysicalDeviceProperties(pdev).limits.timestampPeriod
+    _qpre = vk.vkCreateQueryPool(dev, vk.VkQueryPoolCreateInfo(queryType=vk.VK_QUERY_TYPE_TIMESTAMP, queryCount=256), None)
+    _preagg = {}
 memp = vk.vkGetPhysicalDeviceMemoryProperties(pdev)
 HV = vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
 def memtype(bits):
@@ -349,26 +354,35 @@ def gd(C, pp, pl, dset, gx, gy=1):
     vk.vkCmdBindPipeline(C, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pp)
     vk.vkCmdBindDescriptorSets(C, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, [dset], 0, None)
     vk.vkCmdDispatch(C, gx, gy, 1); vk.vkCmdPipelineBarrier(C, CS, CS, 0, 1, [MB], 0, None, 0, None)
-def gmm(C, t):   # fp16 coopmat: cast-down -> GEMM (grid N/64 x M/64) -> cast-up
+def gmm(C, t, L=None, tag=""):   # fp16 coopmat: cast-down -> GEMM (grid N/64 x M/64) -> cast-up
     cin, gem, cout, N, K = t
-    gd(C, P_castdn, PLca, cin, (MC * K + 63) // 64)
-    gd(C, P_cgemm16, PLcg, gem, N // 64, MC // 64)
-    gd(C, P_castup, PLca, cout, (MC * N + 63) // 64)
+    gd(C, P_castdn, PLca, cin, (MC * K + 63) // 64);   tsp(C, L, "cast")
+    gd(C, P_cgemm16, PLcg, gem, N // 64, MC // 64);    tsp(C, L, tag + "_mm")
+    gd(C, P_castup, PLca, cout, (MC * N + 63) // 64);  tsp(C, L, "cast")
 # GROUP GLAY layers per submit: a full 48-layer chunk in one submit (~5s) trips the Windows TDR
 # watchdog (~2s), but 1-per-layer wastes ~48 CPU<->GPU round-trips/chunk. Grouping cuts that overhead
 # while staying well under TDR. Buffers persist across submits so the chunk flows.
 # NB: tried GLAY=8 (6 submits/chunk vs 48) -> no measurable gain (34.6 vs 31.8s, within thermal noise);
 # the per-layer submit/fence overhead is ~1.5% of prefill, below the noise floor. Kept GLAY=1.
 GLAY = 1
+def tsp(C, L, label):   # prefill timestamp (no-op unless PREPROF); indices are per-layer (pool reset each layer)
+    if PREPROF:
+        vk.vkCmdWriteTimestamp(C, _BOP, _qpre, len(L["_lbl"])); L["_lbl"].append(label)
 def rec_layer(C, L):
-    gd(C, P_pn, PLpn, L["p_in"], MC)
-    gmm(C, L["p_q"]); gmm(C, L["p_k"])
-    if L["vp"]: gmm(C, L["p_v"])
-    gd(C, P_ppk, PLap, L["p_prep"], L["nkv"], MC); gd(C, P_pat, PLap, L["p_attn"], nH, MC)
-    gmm(C, L["p_o"]); gd(C, P_pna, PLpn, L["p_na"], MC)
-    gd(C, P_pn, PLpn, L["p_pfn"], MC)
-    gmm(C, L["p_g"]); gmm(C, L["p_u"]); gd(C, P_gm, PLpn, L["p_gm"], (MC * I + 63) // 64)
-    gmm(C, L["p_d"]); gd(C, P_pna, PLpn, L["p_nas"], MC)
+    if PREPROF: vk.vkCmdResetQueryPool(C, _qpre, 0, 256); L["_lbl"] = []
+    tsp(C, L, "start")
+    gd(C, P_pn, PLpn, L["p_in"], MC); tsp(C, L, "norm")
+    gmm(C, L["p_q"], L, "qkv"); gmm(C, L["p_k"], L, "qkv")
+    if L["vp"]: gmm(C, L["p_v"], L, "qkv")
+    gd(C, P_ppk, PLap, L["p_prep"], L["nkv"], MC); tsp(C, L, "prepkv")
+    gd(C, P_pat, PLap, L["p_attn"], nH, MC); tsp(C, L, "attn")
+    gmm(C, L["p_o"], L, "o")
+    gd(C, P_pna, PLpn, L["p_na"], MC); tsp(C, L, "normadd")
+    gd(C, P_pn, PLpn, L["p_pfn"], MC); tsp(C, L, "norm")
+    gmm(C, L["p_g"], L, "gateup"); gmm(C, L["p_u"], L, "gateup")
+    gd(C, P_gm, PLpn, L["p_gm"], (MC * I + 63) // 64); tsp(C, L, "gelu")
+    gmm(C, L["p_d"], L, "down")
+    gd(C, P_pna, PLpn, L["p_nas"], MC); tsp(C, L, "normadd")
 ngrp = (len(layers) + GLAY - 1) // GLAY
 cb_pre_L = vk.vkAllocateCommandBuffers(dev, vk.VkCommandBufferAllocateInfo(commandPool=cpool,
            level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=ngrp))
@@ -394,6 +408,22 @@ def forward_prefill(chunk_ids, p0):
         vk.vkResetFences(dev, 1, [fence])
         vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[cb_pre_L[li]])], fence)
         vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+        if PREPROF: _read_preprofile(layers[li])
+
+def _read_preprofile(L):
+    n = len(L["_lbl"]); buf = ffi.new(f"uint64_t[{n}]")
+    vk.vkGetQueryPoolResults(dev, _qpre, 0, n, n * 8, buf, 8, vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT)
+    for i in range(1, n):
+        d = (int(buf[i]) - int(buf[i - 1])) * _tsp_pre / 1000.0   # us
+        _preagg[L["_lbl"][i]] = _preagg.get(L["_lbl"][i], 0.0) + d
+
+def print_preprofile(nchunks):
+    if not _preagg: return
+    tot = sum(_preagg.values()) / nchunks
+    print(f"\n=== prefill GPU profile (per {MC}-token chunk, avg of {nchunks} chunks) ===", flush=True)
+    for k in sorted(_preagg, key=lambda x: -_preagg[x]):
+        us = _preagg[k] / nchunks; print(f"  {k:14} {us:9.1f} us  {100*us/tot:5.1f}%", flush=True)
+    print(f"  {'TOTAL':14} {tot:9.1f} us  -> {1e6*MC/tot:.1f} prompt-tok/s (GPU-only)", flush=True)
 
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(MODEL)
@@ -433,6 +463,14 @@ def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=()):
         if pos >= MAXT - 1: return
         logits = forward(nxt, pos); pos += 1
 
+
+if __name__ == "__main__" and PREPROF:
+    nch = 6                                   # warm + timed chunks of MC tokens (synthetic ids)
+    rng = np.random.default_rng(0)
+    for c in range(nch):
+        forward_prefill([int(x) for x in rng.integers(0, V, MC)], c * MC)
+    print_preprofile(nch)
+    sys.exit(0)
 
 if __name__ == "__main__":
     ids = tok.apply_chat_template([{"role": "user", "content": "What is the capital of France? One word."}],
