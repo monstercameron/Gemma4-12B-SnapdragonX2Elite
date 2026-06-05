@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>gemma4-adreno — Gemma 4 12B on a Snapdragon X2 GPU, from-scratch Vulkan</title>
+<meta name="description" content="Running Gemma 4 12B on a Snapdragon X2 Elite's Adreno X2-90 GPU via a hand-written raw-Vulkan compute engine — 13.84 tok/s decode, ~210 prompt-tok/s prefill, 64k context, OpenAI-compatible. The journey, specs, and benchmarks." />
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: { sans: ['Inter','system-ui','sans-serif'], mono: ['"JetBrains Mono"','monospace'] },
+        colors: { ink: '#0a0a0f', panel: '#12121b', edge: '#23233356', adreno: '#e2362f', flux: '#7c5cff', glow: '#22d3ee' },
+      }
+    }
+  }
+</script>
+<style>
+  body { background:
+    radial-gradient(60rem 40rem at 80% -10%, rgba(124,92,255,.16), transparent 60%),
+    radial-gradient(50rem 40rem at 0% 10%, rgba(226,54,47,.12), transparent 55%), #0a0a0f; }
+  .grad { background: linear-gradient(92deg,#fff 0%,#c4b5fd 45%,#fca5a5 100%); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .card { background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.01)); border:1px solid rgba(255,255,255,.07); }
+  .bar { background: linear-gradient(90deg,#7c5cff,#22d3ee); }
+  .bar-win { background: linear-gradient(90deg,#e2362f,#fb923c); box-shadow:0 0 24px -4px rgba(226,54,47,.6); }
+  .bar-dim { background: rgba(255,255,255,.14); }
+  .dot { box-shadow:0 0 0 4px rgba(124,92,255,.15); }
+  ::selection { background: rgba(124,92,255,.35); }
+</style>
+</head>
+<body class="font-sans text-slate-300 antialiased">
+
+<!-- nav -->
+<header class="sticky top-0 z-40 backdrop-blur-xl bg-ink/70 border-b border-white/5">
+  <nav class="max-w-6xl mx-auto px-5 h-16 flex items-center justify-between">
+    <a href="#top" class="font-bold text-white tracking-tight flex items-center gap-2">
+      <span class="w-2.5 h-2.5 rounded-sm bg-adreno inline-block"></span>gemma4-<span class="text-flux">adreno</span>
+    </a>
+    <div class="hidden md:flex items-center gap-7 text-sm text-slate-400">
+      <a href="#specs" class="hover:text-white transition">Specs</a>
+      <a href="#bench" class="hover:text-white transition">Benchmarks</a>
+      <a href="#journey" class="hover:text-white transition">Journey</a>
+      <a href="#features" class="hover:text-white transition">Features</a>
+      <a href="#deadends" class="hover:text-white transition">Dead ends</a>
+    </div>
+    <a href="https://github.com/" class="text-sm font-medium px-3.5 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white hover:bg-white/10 transition">GitHub →</a>
+  </nav>
+</header>
+
+<main id="top">
+
+<!-- hero -->
+<section class="max-w-6xl mx-auto px-5 pt-20 pb-14 text-center">
+  <div class="inline-flex items-center gap-2 text-xs font-medium text-slate-400 px-3 py-1 rounded-full border border-white/10 bg-white/5 mb-7">
+    <span class="w-1.5 h-1.5 rounded-full bg-glow animate-pulse"></span> Snapdragon X2 Elite · Adreno X2-90 · Windows 11 ARM64
+  </div>
+  <h1 class="text-4xl sm:text-6xl font-extrabold tracking-tight text-white leading-[1.05]">
+    <span class="grad">Gemma 4 12B</span><br class="hidden sm:block" /> on a phone-class GPU,<br/>from scratch.
+  </h1>
+  <p class="max-w-2xl mx-auto mt-6 text-lg text-slate-400">
+    A hand-written <span class="text-white font-medium">raw-Vulkan compute engine</span> — every matmul, attention kernel,
+    RMSNorm and RoPE is a GLSL shader. No ONNX Runtime, no llama.cpp, no Qualcomm QNN/litert.
+    Int4 weights, 64k context, an OpenAI-compatible server. Driven by one command buffer recorded once and resubmitted per token.
+  </p>
+  <div class="mt-9 flex flex-wrap items-center justify-center gap-3">
+    <a href="#bench" class="px-5 py-2.5 rounded-xl font-semibold text-white bg-gradient-to-r from-flux to-glow hover:opacity-90 transition shadow-lg shadow-flux/20">See the benchmarks</a>
+    <a href="#journey" class="px-5 py-2.5 rounded-xl font-semibold text-slate-200 bg-white/5 border border-white/10 hover:bg-white/10 transition">Read the journey</a>
+  </div>
+</section>
+
+<!-- stat band -->
+<section class="max-w-6xl mx-auto px-5">
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div class="card rounded-2xl p-5">
+      <div class="text-3xl font-extrabold text-white font-mono">13.84</div>
+      <div class="text-sm text-slate-400 mt-1">decode tok/s</div>
+      <div class="text-xs text-emerald-400/80 mt-2">+75% vs llama.cpp CPU</div>
+    </div>
+    <div class="card rounded-2xl p-5">
+      <div class="text-3xl font-extrabold text-white font-mono">~210</div>
+      <div class="text-sm text-slate-400 mt-1">prefill prompt-tok/s</div>
+      <div class="text-xs text-emerald-400/80 mt-2">int8 coopmat · 2.2× the f16 path</div>
+    </div>
+    <div class="card rounded-2xl p-5">
+      <div class="text-3xl font-extrabold text-white font-mono">64k</div>
+      <div class="text-sm text-slate-400 mt-1">context tokens</div>
+      <div class="text-xs text-slate-500 mt-2">flash-decode + ring buffer</div>
+    </div>
+    <div class="card rounded-2xl p-5">
+      <div class="text-3xl font-extrabold text-white font-mono">577×</div>
+      <div class="text-sm text-slate-400 mt-1">vs the first working number</div>
+      <div class="text-xs text-slate-500 mt-2">0.024 → 13.84 tok/s</div>
+    </div>
+  </div>
+</section>
+
+<!-- specs -->
+<section id="specs" class="max-w-6xl mx-auto px-5 pt-24">
+  <h2 class="text-2xl sm:text-3xl font-bold text-white">Specs</h2>
+  <p class="text-slate-400 mt-2 max-w-2xl">The whole thing runs on the integrated GPU of a laptop SoC, in 48 GB of unified memory.</p>
+  <div class="grid md:grid-cols-3 gap-4 mt-8">
+    <div class="card rounded-2xl p-6">
+      <div class="text-adreno font-semibold text-sm uppercase tracking-wider">Hardware</div>
+      <dl class="mt-4 space-y-2.5 text-sm">
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">SoC</dt><dd class="text-white text-right">Snapdragon X2 Elite Extreme</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">GPU</dt><dd class="text-white text-right">Adreno X2-90 (wave 64, coopmat)</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Memory</dt><dd class="text-white text-right">48 GB unified LPDDR5x</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Bandwidth</dt><dd class="text-white text-right">~123 GB/s achievable</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">OS</dt><dd class="text-white text-right">Windows 11 ARM64</dd></div>
+      </dl>
+    </div>
+    <div class="card rounded-2xl p-6">
+      <div class="text-flux font-semibold text-sm uppercase tracking-wider">Model</div>
+      <dl class="mt-4 space-y-2.5 text-sm">
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Name</dt><dd class="text-white text-right">Gemma 4 12B-it</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Layers</dt><dd class="text-white text-right">48 dense</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Hidden / FFN</dt><dd class="text-white text-right">3840 / 15360</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Heads</dt><dd class="text-white text-right">16 (GQA, sliding+global)</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Vocab</dt><dd class="text-white text-right">262,144</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Quant</dt><dd class="text-white text-right">int4 weights (~6 GB)</dd></div>
+      </dl>
+    </div>
+    <div class="card rounded-2xl p-6">
+      <div class="text-glow font-semibold text-sm uppercase tracking-wider">Engine</div>
+      <dl class="mt-4 space-y-2.5 text-sm">
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Stack</dt><dd class="text-white text-right">raw Vulkan 1.1 + GLSL→SPIR-V</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Decode</dt><dd class="text-white text-right">int4 GEMV, record-once cmd buffer</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Prefill</dt><dd class="text-white text-right">coopmat matrix-core GEMM</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Shaders</dt><dd class="text-white text-right">~20 hand-written .comp</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Bound by</dt><dd class="text-white text-right">memory bandwidth (decode)</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Deps</dt><dd class="text-white text-right">numpy · vulkan · torch (load only)</dd></div>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<!-- benchmarks -->
+<section id="bench" class="max-w-6xl mx-auto px-5 pt-24">
+  <h2 class="text-2xl sm:text-3xl font-bold text-white">Benchmarks</h2>
+  <p class="text-slate-400 mt-2 max-w-2xl">All measured on the same machine. The custom engine beats every off-the-shelf path — including the CPU it was supposed to lose to.</p>
+
+  <div class="grid lg:grid-cols-2 gap-4 mt-8">
+    <!-- decode bars -->
+    <div class="card rounded-2xl p-6">
+      <div class="flex items-baseline justify-between">
+        <h3 class="text-white font-semibold">Decode throughput</h3>
+        <span class="text-xs text-slate-500 font-mono">tok/s · higher is better</span>
+      </div>
+      <div class="mt-6 space-y-4 text-sm">
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-white font-medium">raw-Vulkan + uvec2 (this engine)</span><span class="font-mono text-white">13.84</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-win" style="width:100%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-300">raw-Vulkan, scalar GEMV</span><span class="font-mono text-slate-300">~10.7</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:77%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">llama.cpp · CPU</span><span class="font-mono text-slate-400">7.9</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:57%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">custom wgpu (WebGPU-bound)</span><span class="font-mono text-slate-400">7.07</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:51%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">llama.cpp · Vulkan</span><span class="font-mono text-slate-400">6.06</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:44%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-500">ONNX/QNN → GPU (where this began)</span><span class="font-mono text-slate-500">0.024</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:1.5%"></div></div>
+        </div>
+      </div>
+      <p class="text-xs text-slate-500 mt-5">Decode is memory-bandwidth-bound: ~106 of the ~123 GB/s achievable ceiling, ≈86% of the roof.</p>
+    </div>
+
+    <!-- prefill + optimizations -->
+    <div class="space-y-4">
+      <div class="card rounded-2xl p-6">
+        <div class="flex items-baseline justify-between">
+          <h3 class="text-white font-semibold">Prefill throughput</h3>
+          <span class="text-xs text-slate-500 font-mono">prompt-tok/s</span>
+        </div>
+        <div class="mt-6 space-y-4 text-sm">
+          <div>
+            <div class="flex justify-between mb-1"><span class="text-white font-medium">int8 coopmat (W8A8, opt-in)</span><span class="font-mono text-white">~210</span></div>
+            <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-win" style="width:100%"></div></div>
+          </div>
+          <div>
+            <div class="flex justify-between mb-1"><span class="text-slate-300">fp16 coopmat + fp16 KV</span><span class="font-mono text-slate-300">~105</span></div>
+            <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:50%"></div></div>
+          </div>
+          <div>
+            <div class="flex justify-between mb-1"><span class="text-slate-400">per-token (pre-batching)</span><span class="font-mono text-slate-400">~9</span></div>
+            <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:4%"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="card rounded-2xl p-6">
+        <h3 class="text-white font-semibold">Optimization levers <span class="text-slate-500 font-normal text-sm">(shipped)</span></h3>
+        <ul class="mt-4 space-y-2.5 text-sm">
+          <li class="flex justify-between"><span class="text-slate-300">uvec2 wide weight loads</span><span class="font-mono text-emerald-400">+29% decode</span></li>
+          <li class="flex justify-between"><span class="text-slate-300">fp16 KV cache</span><span class="font-mono text-emerald-400">+10.5% prefill · 2× ctx</span></li>
+          <li class="flex justify-between"><span class="text-slate-300">W8A8 int8 prefill GEMM</span><span class="font-mono text-emerald-400">2.0× prefill</span></li>
+          <li class="flex justify-between"><span class="text-slate-300">fp8 e4m3 decode scales (opt-in)</span><span class="font-mono text-emerald-400">+4.5–8% decode</span></li>
+          <li class="flex justify-between"><span class="text-slate-300">prefix KV cache (repeated prompts)</span><span class="font-mono text-emerald-400">−26–29% latency</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- journey -->
+<section id="journey" class="max-w-6xl mx-auto px-5 pt-24">
+  <h2 class="text-2xl sm:text-3xl font-bold text-white">The journey</h2>
+  <p class="text-slate-400 mt-2 max-w-2xl">From Google's own tooling failing to load, down through the NPU, to a from-scratch Vulkan engine — every step decided by measurement.</p>
+  <ol class="mt-10 relative border-l border-white/10 ml-2 space-y-8">
+    <li class="ml-6">
+      <span class="absolute -left-[7px] mt-1 w-3.5 h-3.5 rounded-full bg-adreno dot"></span>
+      <div class="text-xs font-mono text-slate-500">Phase 1–5 · the off-the-shelf paths</div>
+      <h3 class="text-white font-semibold mt-1">Google litert-lm won't load; the NPU is a dead end</h3>
+      <p class="text-sm text-slate-400 mt-1">litert-lm hits a 256 MB buffer cap. The Hexagon NPU runs but produces the wrong token (fp16 overflow + QNN error 1003). The ONNX/QNN GPU path is correct but swap-bound at <span class="font-mono">0.024 tok/s</span>. llama.cpp CPU (7.9) becomes the bar to beat.</p>
+    </li>
+    <li class="ml-6">
+      <span class="absolute -left-[7px] mt-1 w-3.5 h-3.5 rounded-full bg-flux dot"></span>
+      <div class="text-xs font-mono text-slate-500">Phase 6–7 · WebGPU, then down to Vulkan</div>
+      <h3 class="text-white font-semibold mt-1">A wgpu engine (7.07) hits the WebGPU wall</h3>
+      <p class="text-sm text-slate-400 mt-1">996 compute passes rebuilt every token = ~100 ms of CPU encode. WebGPU can't record-once. Dropping to raw Vulkan and recording the entire ~600-dispatch token graph into one resubmitted command buffer eliminates it → <span class="font-mono text-white">~10.7 tok/s</span>.</p>
+    </li>
+    <li class="ml-6">
+      <span class="absolute -left-[7px] mt-1 w-3.5 h-3.5 rounded-full bg-glow dot"></span>
+      <div class="text-xs font-mono text-slate-500">Phase 8 · the bandwidth pass</div>
+      <h3 class="text-white font-semibold mt-1">Microbench-driven kernel rebuild → 13.84 tok/s</h3>
+      <p class="text-sm text-slate-400 mt-1">Decode is a bandwidth-bound GEMV. Reinterpreting weights as 64-bit <span class="font-mono">uvec2</span> loads (16 outputs/thread) lifts the load path 82→109 GB/s; parallel-softmax attention; adaptive K-split. <span class="font-mono text-white">+29%</span>, to ~86% of the bandwidth roof.</p>
+    </li>
+    <li class="ml-6">
+      <span class="absolute -left-[7px] mt-1 w-3.5 h-3.5 rounded-full bg-adreno dot"></span>
+      <div class="text-xs font-mono text-slate-500">Phase 10–15 · context + prefill</div>
+      <h3 class="text-white font-semibold mt-1">64k context and a 2.2× prefill</h3>
+      <p class="text-sm text-slate-400 mt-1">Flash-decode attention + a sliding-window ring buffer reach 64k. Batched prefill on the coopmat matrix cores, then fp16 KV and an int8 (W8A8) GEMM — discovered because int8 coopmat is 3.7× the f16 path here — take prefill from ~95 to ~210 prompt-tok/s.</p>
+    </li>
+    <li class="ml-6">
+      <span class="absolute -left-[7px] mt-1 w-3.5 h-3.5 rounded-full bg-flux dot"></span>
+      <div class="text-xs font-mono text-slate-500">Phase 16–21 · serving</div>
+      <h3 class="text-white font-semibold mt-1">An OpenAI-compatible server an agent can drive</h3>
+      <p class="text-sm text-slate-400 mt-1">Chat Completions + tool calling (Gemma's native format), a Responses API, a stateful session WebSocket, a transparent prefix KV cache (multi-turn drops to ~3–7 s/turn), and a degeneration guard. opencode runs against it.</p>
+    </li>
+  </ol>
+  <p class="text-sm text-slate-500 mt-8">The full log — every dead end, microbenchmark, and reversal — is in <a href="https://github.com/" class="text-flux hover:underline">JOURNEY.md</a>.</p>
+</section>
+
+<!-- features -->
+<section id="features" class="max-w-6xl mx-auto px-5 pt-24">
+  <h2 class="text-2xl sm:text-3xl font-bold text-white">What it does</h2>
+  <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-8">
+    <div class="card rounded-2xl p-6"><h3 class="text-white font-semibold">OpenAI-compatible API</h3><p class="text-sm text-slate-400 mt-2"><code class="text-glow font-mono text-xs">/v1/chat/completions</code> (streaming + tools), <code class="text-glow font-mono text-xs">/v1/completions</code>, <code class="text-glow font-mono text-xs">/v1/responses</code>, <code class="text-glow font-mono text-xs">/v1/models</code>.</p></div>
+    <div class="card rounded-2xl p-6"><h3 class="text-white font-semibold">Tool / function calling</h3><p class="text-sm text-slate-400 mt-2">Renders OpenAI tools to Gemma 4's native tool format and parses the calls back. Drives agent clients like opencode.</p></div>
+    <div class="card rounded-2xl p-6"><h3 class="text-white font-semibold">Stateful session WebSocket</h3><p class="text-sm text-slate-400 mt-2"><code class="text-glow font-mono text-xs">/v1/sessions</code> keeps the conversation server-side; the client sends only the next message. Rides the prefix cache.</p></div>
+    <div class="card rounded-2xl p-6"><h3 class="text-white font-semibold">Prefix KV caching</h3><p class="text-sm text-slate-400 mt-2">Auto-detects a shared prompt prefix, restores its KV with a ~ms GPU copy instead of re-prefilling — repeated prompts skip the prefix.</p></div>
+    <div class="card rounded-2xl p-6"><h3 class="text-white font-semibold">64k context</h3><p class="text-sm text-slate-400 mt-2">Flash-decode attention (online softmax, unbounded T) + a sliding-window ring buffer for the local layers. Fits in 48 GB.</p></div>
+    <div class="card rounded-2xl p-6"><h3 class="text-white font-semibold">Built-in profiler</h3><p class="text-sm text-slate-400 mt-2">Vulkan timestamp queries (<code class="text-glow font-mono text-xs">PROFILE=1</code> / <code class="text-glow font-mono text-xs">PREPROF=1</code>) give per-kernel decode and prefill breakdowns.</p></div>
+  </div>
+</section>
+
+<!-- dead ends -->
+<section id="deadends" class="max-w-6xl mx-auto px-5 pt-24">
+  <h2 class="text-2xl sm:text-3xl font-bold text-white">Measured &amp; rejected</h2>
+  <p class="text-slate-400 mt-2 max-w-2xl">The honest half of the work — optimizations that looked good and were walked away from after measuring. An "it didn't help" with numbers is a result.</p>
+  <div class="mt-8 card rounded-2xl overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="text-slate-400 text-left border-b border-white/10">
+        <tr><th class="font-medium py-3 px-5">Idea</th><th class="font-medium py-3 px-5">Verdict</th><th class="font-medium py-3 px-5 hidden sm:table-cell">Why</th></tr>
+      </thead>
+      <tbody class="divide-y divide-white/5">
+        <tr><td class="py-3 px-5 text-white">Hexagon NPU (HTP)</td><td class="py-3 px-5 text-adreno">dead end</td><td class="py-3 px-5 text-slate-400 hidden sm:table-cell">fp16 overflow fixed, but QNN execute error 1003 miscomputes to NaN</td></tr>
+        <tr><td class="py-3 px-5 text-white">MTP / self-speculation</td><td class="py-3 px-5 text-adreno">unavailable</td><td class="py-3 px-5 text-slate-400 hidden sm:table-cell">Gemma 4 has no multi-token-prediction heads to draft from</td></tr>
+        <tr><td class="py-3 px-5 text-white">Prompt-lookup spec decoding</td><td class="py-3 px-5 text-adreno">not worth it</td><td class="py-3 px-5 text-slate-400 hidden sm:table-cell">verify costs ~8–16 decode-tokens; real acceptance only ~0.2–3</td></tr>
+        <tr><td class="py-3 px-5 text-white">W4A8 (on-the-fly requant)</td><td class="py-3 px-5 text-adreno">4× slower</td><td class="py-3 px-5 text-slate-400 hidden sm:table-cell">per-element float-mul+round dominates; precomputed int8 won instead</td></tr>
+        <tr><td class="py-3 px-5 text-white">Subgroup-reduce attention</td><td class="py-3 px-5 text-adreno">reverted</td><td class="py-3 px-5 text-slate-400 hidden sm:table-cell">non-finite logits on this Adreno; &lt;1% impact anyway</td></tr>
+        <tr><td class="py-3 px-5 text-white">GEMM dequant-hoist</td><td class="py-3 px-5 text-adreno">regressed</td><td class="py-3 px-5 text-slate-400 hidden sm:table-cell">2 coopmat accumulators spill registers, collapse occupancy</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- cta -->
+<section class="max-w-6xl mx-auto px-5 pt-24">
+  <div class="card rounded-3xl p-10 text-center relative overflow-hidden">
+    <div class="absolute inset-0 -z-10 opacity-40" style="background:radial-gradient(40rem 20rem at 50% 0%, rgba(124,92,255,.25), transparent 60%)"></div>
+    <h2 class="text-2xl sm:text-3xl font-bold text-white">Run it yourself</h2>
+    <p class="text-slate-400 mt-2 max-w-xl mx-auto">Native ARM64 Python 3.12 + the Vulkan SDK. One command sets up the env, downloads the weights, and builds the shaders.</p>
+    <div class="mt-6 inline-block text-left bg-black/40 border border-white/10 rounded-xl px-5 py-4 font-mono text-sm text-slate-300">
+      <span class="text-slate-500"># Windows ARM64</span><br/>
+      .\scripts\setup.ps1 -Model<br/>
+      .venv-gemma4\Scripts\python.exe src\serve.py
+    </div>
+    <div class="mt-7"><a href="https://github.com/" class="px-5 py-2.5 rounded-xl font-semibold text-white bg-gradient-to-r from-adreno to-flux hover:opacity-90 transition">View the repository →</a></div>
+  </div>
+</section>
+
+</main>
+
+<footer class="max-w-6xl mx-auto px-5 py-14 mt-12 border-t border-white/5 text-sm text-slate-500 flex flex-col sm:flex-row items-center justify-between gap-4">
+  <div>gemma4-adreno · MIT-licensed engine · Gemma weights under Google's Gemma Terms of Use</div>
+  <div class="flex items-center gap-5">
+    <a href="https://github.com/" class="hover:text-white transition">Repository</a>
+    <a href="#top" class="hover:text-white transition">Back to top ↑</a>
+  </div>
+</footer>
+
+</body>
+</html>
