@@ -1,0 +1,28 @@
+# --- large model weights (download separately; see README) ---
+models/
+gguf/
+*.gguf
+*.onnx
+*.onnx_data
+
+# --- python venv & caches ---
+.venv-gemma4/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- logs / scratch output ---
+out/
+*.log
+
+# --- vendor docs (not redistributable) ---
+manuals/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

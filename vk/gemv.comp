@@ -1,0 +1,36 @@
+#version 450
+// uvec2 (64-bit) weight loads: each thread does 16 outputs from one uvec2 (= 2 u32 = 16 nibbles).
+// Microbench (microbench_width.py) showed the wide load lifts the GEMV load path ~82->109 GB/s on
+// Adreno (fewer, wider memory transactions). Same weight buffer bytes; reinterpreted as uvec2.
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Xb { float x[]; };
+layout(std430, binding=1) readonly  buffer Wb { uvec2 wpackT[]; };  // [K, N/16] uvec2 view of [K,N/8] u32
+layout(std430, binding=2) readonly  buffer Sb { uint  scalesT[]; };
+layout(std430, binding=3) writeonly buffer Pb { float partial[]; };
+layout(std140, binding=4) uniform Ub { uvec4 d; };   // N, nb8, bpc, blk
+void main() {
+  uint Nn=d.x; uint nb16=d.y/2u; uint bpc=d.z; uint bk=d.w;
+  uint t=gl_GlobalInvocationID.x; uint c=gl_GlobalInvocationID.y;
+  if (t*16u >= Nn) return;
+  vec4 a0=vec4(0.0); vec4 a1=vec4(0.0); vec4 a2=vec4(0.0); vec4 a3=vec4(0.0); uint b0=c*bpc;
+  for (uint bi=0u; bi<bpc; bi++) {
+    uint b=b0+bi; uint su=(b*Nn + t*16u)/2u;
+    vec4 s0=vec4(unpackHalf2x16(scalesT[su]),    unpackHalf2x16(scalesT[su+1u]));
+    vec4 s1=vec4(unpackHalf2x16(scalesT[su+2u]), unpackHalf2x16(scalesT[su+3u]));
+    vec4 s2=vec4(unpackHalf2x16(scalesT[su+4u]), unpackHalf2x16(scalesT[su+5u]));
+    vec4 s3=vec4(unpackHalf2x16(scalesT[su+6u]), unpackHalf2x16(scalesT[su+7u]));
+    uint kb=b*bk;
+    for (uint kk=0u; kk<bk; kk++) {
+      uint k=kb+kk; uvec2 p=wpackT[k*nb16+t]; float xv=x[k]; uint lo=p.x; uint hi=p.y;
+      a0 += (vec4(float(lo&15u),float((lo>>4u)&15u),float((lo>>8u)&15u),float((lo>>12u)&15u))-vec4(8.0))*s0*xv;
+      a1 += (vec4(float((lo>>16u)&15u),float((lo>>20u)&15u),float((lo>>24u)&15u),float((lo>>28u)&15u))-vec4(8.0))*s1*xv;
+      a2 += (vec4(float(hi&15u),float((hi>>4u)&15u),float((hi>>8u)&15u),float((hi>>12u)&15u))-vec4(8.0))*s2*xv;
+      a3 += (vec4(float((hi>>16u)&15u),float((hi>>20u)&15u),float((hi>>24u)&15u),float((hi>>28u)&15u))-vec4(8.0))*s3*xv;
+    }
+  }
+  uint o=c*Nn+t*16u;
+  partial[o]=a0.x;partial[o+1u]=a0.y;partial[o+2u]=a0.z;partial[o+3u]=a0.w;
+  partial[o+4u]=a1.x;partial[o+5u]=a1.y;partial[o+6u]=a1.z;partial[o+7u]=a1.w;
+  partial[o+8u]=a2.x;partial[o+9u]=a2.y;partial[o+10u]=a2.z;partial[o+11u]=a2.w;
+  partial[o+12u]=a3.x;partial[o+13u]=a3.y;partial[o+14u]=a3.z;partial[o+15u]=a3.w;
+}

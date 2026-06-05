@@ -1,0 +1,7 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer S { float src[]; };
+layout(std430, binding=1) writeonly buffer D { float16_t dst[]; };
+layout(std140, binding=2) uniform U { uvec4 d; };
+void main() { uint i = gl_GlobalInvocationID.x; if (i >= d.x) return; dst[i] = float16_t(src[i]); }

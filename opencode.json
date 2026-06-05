@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "gemma-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Gemma 4 (local Adreno/Vulkan)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "local-no-key"
+      },
+      "models": {
+        "gemma-4-12b-it": {
+          "name": "Gemma 4 12B (Snapdragon X2 GPU)"
+        }
+      }
+    }
+  },
+  "model": "gemma-local/gemma-4-12b-it"
+}

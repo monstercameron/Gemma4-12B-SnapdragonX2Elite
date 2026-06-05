@@ -1,0 +1,13 @@
+#version 450
+// Batched RMSNorm for prefill: one workgroup per token (grid.x = M), each normalizes its own D-vector.
+layout(local_size_x=256) in;
+layout(std430,binding=0) readonly buffer Xb{float x[];};   // [M,D]
+layout(std430,binding=1) readonly buffer Wb{float w[];};   // [D]
+layout(std430,binding=2) writeonly buffer Yb{float y[];};  // [M,D]
+layout(std140,binding=3) uniform Db{uvec4 d;};             // D, M
+shared float sh[256];
+void main(){ uint D=d.x; uint m=gl_WorkGroupID.x; uint t=gl_LocalInvocationID.x; uint base=m*D;
+  float s=0.0; for(uint i=t;i<D;i+=256u){float v=x[base+i]; s+=v*v;} sh[t]=s; barrier();
+  for(uint st=128u;st>0u;st>>=1u){ if(t<st){sh[t]+=sh[t+st];} barrier(); }
+  float inv=inversesqrt(sh[0]/float(D)+1e-6);
+  for(uint i=t;i<D;i+=256u){ y[base+i]=x[base+i]*inv*w[i]; } }

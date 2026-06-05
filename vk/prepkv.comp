@@ -1,0 +1,28 @@
+#version 450
+// Writes one layer's K (normed+roped) and V (normed) into the KV cache at this token's slot.
+// Sliding layers use a ring buffer: slot = pos % window (window=WIN). Global layers: slot = pos.
+layout(local_size_x=256) in;
+layout(std430,binding=0) readonly buffer Q{float qkv[];};
+layout(std430,binding=1) readonly buffer KN{float knw[];};
+layout(std430,binding=2) readonly buffer CO{float cosb[];};
+layout(std430,binding=3) readonly buffer SI{float sinb[];};
+layout(std430,binding=4) buffer KC{float kc[];};
+layout(std430,binding=5) buffer VC{float vc[];};
+layout(std140,binding=6) uniform Pb{uvec4 p0; uvec4 p1;};   // p0=(nkv,hd,koff,voff) p1=(keqv,stride,window,0)
+layout(std140,binding=7) uniform Dy{uvec4 dy;};             // dy=(pos,...)
+shared float hv[512]; shared float sh[256];
+void main(){ uint kvh=gl_WorkGroupID.x; uint hd=p0.y; uint t=gl_LocalInvocationID.x; uint hf=hd/2u;
+  uint koff=p0.z; uint voff=p0.w; uint keqv=p1.x; uint stride=p1.y; uint window=p1.z;
+  uint pos=dy.x; uint slot=(window>0u)?(pos%window):pos;
+  for(uint i=t;i<hd;i+=256u){ hv[i]=qkv[koff+kvh*hd+i]; } barrier();
+  float s=0.0; for(uint i=t;i<hd;i+=256u){s+=hv[i]*hv[i];} sh[t]=s; barrier();
+  for(uint st=128u;st>0u;st>>=1u){ if(t<st){sh[t]+=sh[t+st];} barrier(); }
+  float ik=inversesqrt(sh[0]/float(hd)+1e-6);
+  for(uint i=t;i<hd;i+=256u){ hv[i]=hv[i]*ik*knw[i]; } barrier();
+  for(uint i=t;i<hd;i+=256u){ float rh; if(i<hf){rh=-hv[i+hf];}else{rh=hv[i-hf];} kc[(kvh*stride+slot)*hd+i]=hv[i]*cosb[i]+rh*sinb[i]; }
+  barrier(); uint vo=voff; if(keqv==1u){vo=koff;}
+  for(uint i=t;i<hd;i+=256u){ hv[i]=qkv[vo+kvh*hd+i]; } barrier();
+  s=0.0; for(uint i=t;i<hd;i+=256u){s+=hv[i]*hv[i];} sh[t]=s; barrier();
+  for(uint st=128u;st>0u;st>>=1u){ if(t<st){sh[t]+=sh[t+st];} barrier(); }
+  float iv=inversesqrt(sh[0]/float(hd)+1e-6);
+  for(uint i=t;i<hd;i+=256u){ vc[(kvh*stride+slot)*hd+i]=hv[i]*iv; } }

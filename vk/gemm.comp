@@ -1,0 +1,30 @@
+#version 450
+// Batched int4 GEMM for prefill: Y[M,N] = X[M,K] @ dequant(W). Each thread does 8 output columns x
+// MT tokens, loading each weight u32 ONCE and applying to all MT tokens -> the weight read is
+// amortized across the batch (microbench_gemm.py: 8-26x vs the M=1 GEMV). Single pass over K (no
+// reduce: the MT-token tiling already gives occupancy).
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer Xb{float x[];};   // [M,K]
+layout(std430,binding=1) readonly buffer Wb{uint  wp[];};  // [K,N/8]
+layout(std430,binding=2) readonly buffer Sb{uint  sc[];};  // [nblk,N] fp16
+layout(std430,binding=3) writeonly buffer Yb{float y[];};  // [M,N]
+layout(std140,binding=4) uniform Ub{uvec4 d;};             // N, K, M, nb8
+const uint MT=8u;
+void main(){ uint N=d.x; uint K=d.y; uint M=d.z; uint nb8=d.w;
+  uint t=gl_GlobalInvocationID.x; uint m0=gl_GlobalInvocationID.y*MT;
+  if(t*8u>=N){return;}
+  vec4 a0[8]; vec4 a1[8];
+  for(uint i=0u;i<MT;i++){ a0[i]=vec4(0.0); a1[i]=vec4(0.0); }
+  uint nblk=K/32u;
+  for(uint b=0u;b<nblk;b++){ uint su=(b*N+t*8u)/2u;
+    vec4 s0=vec4(unpackHalf2x16(sc[su]),  unpackHalf2x16(sc[su+1u]));
+    vec4 s1=vec4(unpackHalf2x16(sc[su+2u]),unpackHalf2x16(sc[su+3u]));
+    for(uint kk=0u;kk<32u;kk++){ uint k=b*32u+kk; uint p=wp[k*nb8+t];
+      vec4 lw=(vec4(float(p&15u),float((p>>4u)&15u),float((p>>8u)&15u),float((p>>12u)&15u))-vec4(8.0))*s0;
+      vec4 hw=(vec4(float((p>>16u)&15u),float((p>>20u)&15u),float((p>>24u)&15u),float((p>>28u)&15u))-vec4(8.0))*s1;
+      for(uint mt=0u;mt<MT;mt++){ uint m=m0+mt; if(m<M){ float xv=x[m*K+k]; a0[mt]+=lw*xv; a1[mt]+=hw*xv; } }
+    } }
+  for(uint mt=0u;mt<MT;mt++){ uint m=m0+mt; if(m<M){ uint o=m*N+t*8u;
+    y[o]=a0[mt].x;y[o+1u]=a0[mt].y;y[o+2u]=a0[mt].z;y[o+3u]=a0[mt].w;
+    y[o+4u]=a1[mt].x;y[o+5u]=a1[mt].y;y[o+6u]=a1[mt].z;y[o+7u]=a1[mt].w; } }
+}

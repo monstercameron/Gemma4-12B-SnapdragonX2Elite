@@ -1,0 +1,24 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+// int8 coopmat GEMM: s8 x s8 -> s32, 64x64x32 tiles (K=32, deepest tile). Raw throughput probe.
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Ab { int8_t  A[]; };
+layout(std430, binding=1) readonly  buffer Bb { int8_t  B[]; };
+layout(std430, binding=2) writeonly buffer Cb { int32_t C[]; };
+layout(std140, binding=3) uniform Ub { uvec4 d; };   // M,N,K
+void main() {
+  uint N = d.y; uint K = d.z; uint tr = gl_WorkGroupID.y * 64u; uint tc = gl_WorkGroupID.x * 64u;
+  coopmat<int32_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator> acc =
+      coopmat<int32_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator>(0);
+  for (uint k = 0u; k < K; k += 32u) {
+    coopmat<int8_t, gl_ScopeSubgroup, 64, 32, gl_MatrixUseA> ma;
+    coopmat<int8_t, gl_ScopeSubgroup, 32, 64, gl_MatrixUseB> mb;
+    coopMatLoad(ma, A, tr * K + k, K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, B, k * N + tc, N, gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(ma, mb, acc);
+  }
+  coopMatStore(acc, C, tr * N + tc, N, gl_CooperativeMatrixLayoutRowMajor);
+}

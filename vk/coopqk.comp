@@ -1,0 +1,24 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// attention scores via coopmat: S[M,T] = Q[M,hd] @ K[T,hd]^T. K loaded COLUMN-MAJOR = the transpose,
+// so no explicit transpose buffer. Tiles 64x64, contract hd in 16-chunks.
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Qb { float16_t Q[]; };
+layout(std430, binding=1) readonly  buffer Kb { float16_t K[]; };
+layout(std430, binding=2) writeonly buffer Sb { float16_t S[]; };
+layout(std140, binding=3) uniform Ub { uvec4 d; };   // M, T, hd
+void main() {
+  uint T = d.y; uint hd = d.z; uint qr = gl_WorkGroupID.y * 64u; uint kc = gl_WorkGroupID.x * 64u;
+  coopmat<float16_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator> acc =
+      coopmat<float16_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator>(float16_t(0.0));
+  for (uint k = 0u; k < hd; k += 16u) {
+    coopmat<float16_t, gl_ScopeSubgroup, 64, 16, gl_MatrixUseA> ma;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseB> mb;
+    coopMatLoad(ma, Q, qr * hd + k, hd, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, K, kc * hd + k, hd, gl_CooperativeMatrixLayoutColumnMajor);  // = K^T
+    acc = coopMatMulAdd(ma, mb, acc);
+  }
+  coopMatStore(acc, S, qr * T + kc, T, gl_CooperativeMatrixLayoutRowMajor);
+}

@@ -1,0 +1,35 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// fp16 int4-weight coopmat GEMM (K=16 tile -> ~1.5x the fp32 K=8 path). X,Y fp16.
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Xb { float16_t X[]; };
+layout(std430, binding=1) readonly  buffer Wb { uint  wp[]; };
+layout(std430, binding=2) readonly  buffer Sb { uint  sc[]; };
+layout(std430, binding=3) writeonly buffer Yb { float16_t Y[]; };
+layout(std140, binding=4) uniform Ub { uvec4 d; };   // N,K,M,nb8
+shared float16_t wsh[16 * 64];
+void main() {
+  uint N = d.x; uint K = d.y; uint nb8 = d.w;
+  uint tr = gl_WorkGroupID.y * 64u; uint tc = gl_WorkGroupID.x * 64u; uint t = gl_LocalInvocationID.x;
+  coopmat<float16_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator> acc =
+      coopmat<float16_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator>(float16_t(0.0));
+  for (uint k = 0u; k < K; k += 16u) {
+    for (uint idx = t; idx < 16u * 64u; idx += 64u) {
+      uint kk = idx >> 6u; uint nn = idx & 63u; uint kr = k + kk; uint nc = tc + nn;
+      uint q = (wp[kr * nb8 + (nc >> 3u)] >> ((nc & 7u) * 4u)) & 15u;
+      uint si = (kr >> 5u) * N + nc;
+      vec2 sp = unpackHalf2x16(sc[si >> 1u]); float scl = ((si & 1u) == 0u) ? sp.x : sp.y;
+      wsh[(kk << 6u) + nn] = float16_t((float(q) - 8.0) * scl);
+    }
+    barrier();
+    coopmat<float16_t, gl_ScopeSubgroup, 64, 16, gl_MatrixUseA> ma;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseB> mb;
+    coopMatLoad(ma, X, tr * K + k, K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, wsh, 0u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(ma, mb, acc);
+    barrier();
+  }
+  coopMatStore(acc, Y, tr * N + tc, N, gl_CooperativeMatrixLayoutRowMajor);
+}

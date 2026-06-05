@@ -1,0 +1,18 @@
+# Native ARM64 Python 3.12 (cp312) required to reach the Adreno GPU — the x64-emulated
+# default Python cannot. See README.
+
+# --- core engine (Vulkan compute) ---
+numpy
+vulkan            # cffi binding to the Vulkan loader (kompute does NOT build on win-arm64)
+
+# --- model load / export (HF reference forward reused for correctness) ---
+torch             # 2.12 ARM64
+transformers==5.10.1   # first release with gemma4_unified support
+
+# --- OpenAI-compatible server ---
+fastapi
+uvicorn[standard]
+openai            # only for the client-side compliance test
+
+# --- optional: the earlier WebGPU engine in experiments/ ---
+# wgpu
