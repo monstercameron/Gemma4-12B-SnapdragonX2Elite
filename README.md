@@ -108,6 +108,16 @@ copy) instead of re-prefilling it — so repeated prompts skip the prefix. No AP
 two requests. Measured ~26-29% lower latency on a 505-token shared system prompt; longer prefixes
 (RAG contexts) save proportionally more. Validate correctness with `src\test_prefix_cache.py`.
 
+### Endpoints
+
+| Endpoint | What |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming, `usage`) |
+| `POST /v1/completions` | OpenAI legacy completions |
+| `POST /v1/responses` | OpenAI **Responses API** (text) — `input`/`output` shape, typed SSE streaming, and the spec's stateful path (`store` + `previous_response_id`). No native tools/multimodal (text-only engine) |
+| `WS /v1/sessions` | **Stateful session** over one WebSocket — server keeps the conversation, client sends only the next message; multi-turn rides the prefix KV cache. `configure` / `message` → `response.delta` / `response.done` |
+| `GET /v1/models`, `GET /health` | model list, health |
+
 Point any OpenAI client at the server:
 
 ```python
@@ -115,7 +125,10 @@ from openai import OpenAI
 c = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
 print(c.chat.completions.create(model="gemma-4-12b-it",
     messages=[{"role": "user", "content": "What is the capital of France?"}]).choices[0].message.content)
+# the Responses API works too: c.responses.create(model="gemma-4-12b-it", input="Hello")
 ```
+
+Smoke-test the Responses API + session WebSocket: `benchmarks\test_new_apis.py`.
 
 ## License
 
