@@ -58,9 +58,10 @@ JOURNEY.md      the full development log
 
 ## Setup
 
-Requires **native ARM64 Python 3.12** (the x64-emulated default Python cannot reach the NPU/GPU) and,
-to rebuild shaders, the **Vulkan SDK** (`glslangValidator`). The compiled shaders (`vk/*.spv`) are
-committed, so the SDK is optional.
+Requires **native ARM64 Python 3.12** (the x64-emulated default Python cannot reach the NPU/GPU) and
+the **Vulkan SDK** (`glslangValidator`) to compile the shaders. The SPIR-V (`vk/*.spv`) is a build
+artifact (gitignored) — the setup scripts compile it from `vk/*.comp`; the GPU runtime itself only
+needs the Vulkan driver, not the SDK.
 
 ```powershell
 # Windows (ARM64): venv + deps + shaders, then download the weights (~24 GB)

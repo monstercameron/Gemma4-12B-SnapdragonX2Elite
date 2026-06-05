@@ -31,7 +31,8 @@ GLSL compute shaders live in `vk/*.comp`; recompile to SPIR-V after editing:
 bash vk/build.sh          # needs the Vulkan SDK's glslangValidator
 ```
 
-Commit both the `.comp` and the regenerated `.spv`.
+The `.spv` are **build artifacts** (gitignored) — commit only the `.comp`; everyone rebuilds via
+`scripts/setup` or `vk/build.sh`.
 
 ## Before opening a PR
 

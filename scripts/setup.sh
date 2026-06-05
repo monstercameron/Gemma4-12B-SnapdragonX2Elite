@@ -27,12 +27,14 @@ echo "installing dependencies..."
 "$VPY" -m pip install --upgrade pip >/dev/null
 "$VPY" -m pip install -r requirements.txt
 
-# shaders (optional; .spv are committed)
+# shaders (build artifact: vk/*.spv is gitignored, compiled from vk/*.comp)
 if [ "$SHADERS" = 1 ]; then
   if command -v glslangValidator >/dev/null 2>&1; then
     echo "compiling shaders..."; bash vk/build.sh
+  elif ls vk/*.spv >/dev/null 2>&1; then
+    echo "WARN: glslangValidator not found; using existing vk/*.spv."
   else
-    echo "WARN: glslangValidator not found (Vulkan SDK). Using committed vk/*.spv."
+    echo "ERROR: glslangValidator not found and no vk/*.spv present. Install the Vulkan SDK and re-run." >&2; exit 1
   fi
 fi
 

@@ -32,11 +32,13 @@ Write-Host "installing dependencies..."
 & $VPy -m pip install --upgrade pip | Out-Null
 & $VPy -m pip install -r (Join-Path $Root "requirements.txt")
 
-# 4. shaders (optional; .spv are committed)
+# 4. shaders (build artifact: vk/*.spv is gitignored, compiled from vk/*.comp)
 if (-not $NoShaders) {
   $glslang = (Get-Command glslangValidator -ErrorAction SilentlyContinue).Source
   if (-not $glslang) {
-    Write-Warning "glslangValidator not found (Vulkan SDK). Skipping shader rebuild -- committed vk/*.spv will be used."
+    $haveSpv = @(Get-ChildItem (Join-Path $Root "vk\*.spv") -ErrorAction SilentlyContinue).Count
+    if ($haveSpv -gt 0) { Write-Warning "glslangValidator not found; using the $haveSpv existing vk/*.spv." }
+    else { throw "glslangValidator not found and no vk/*.spv present. Install the Vulkan SDK (provides glslangValidator) and re-run -- the .spv are build artifacts, not committed." }
   } else {
     Write-Host "compiling shaders with $glslang..."
     Get-ChildItem (Join-Path $Root "vk\*.comp") | ForEach-Object {

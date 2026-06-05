@@ -5,6 +5,9 @@ gguf/
 *.onnx
 *.onnx_data
 
+# --- build artifacts: compiled shaders (generated from vk/*.comp by scripts/setup or vk/build.sh) ---
+*.spv
+
 # --- python venv & caches ---
 .venv-gemma4/
 .venv/
