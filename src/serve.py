@@ -45,7 +45,7 @@ class Msg(BaseModel):
 class ChatReq(BaseModel):
     model: str = MODEL_ID
     messages: List[Msg]
-    max_tokens: Optional[int] = 256
+    max_tokens: Optional[int] = 16384
     temperature: float = 1.0
     top_p: float = 1.0
     stream: bool = False
@@ -54,7 +54,7 @@ class ChatReq(BaseModel):
 class CompReq(BaseModel):
     model: str = MODEL_ID
     prompt: Union[str, List[str]]
-    max_tokens: Optional[int] = 256
+    max_tokens: Optional[int] = 16384
     temperature: float = 1.0
     top_p: float = 1.0
     stream: bool = False
@@ -70,7 +70,7 @@ def _stops(stop) -> List[str]:
     return [stop] if isinstance(stop, str) else list(stop)
 
 def _fit(prompt_len: int, req_max: Optional[int]) -> int:
-    return max(1, min(req_max or 256, E.MAXT - prompt_len))
+    return max(1, min(req_max or 16384, E.MAXT - prompt_len))
 
 # Prefix KV cache: the engine snapshots a shared prompt prefix's KV so repeated prompts skip
 # re-prefilling it. We auto-detect the prefix as the chunk-aligned longest-common-prefix of consecutive
