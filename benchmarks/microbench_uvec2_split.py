@@ -54,9 +54,6 @@ def bench(K,N,split):
   dev.queue.on_submitted_work_done_sync();R=200;t=time.time()
   for _ in range(R):run()
   dev.queue.on_submitted_work_done_sync();return (time.time()-t)/R*1e3
-def heur(N):
-  rows=(N//8+63)//64; want=max(1,-(-384//max(rows,1))); nblk=3840//BLK if N>4096 else (15360//BLK if False else None)
-  return want
 for name,(K,N) in DIMS.items():
   nblk=K//BLK; best=(1e9,0)
   print(f"\n=== {name} (K={K}) ===",flush=True)

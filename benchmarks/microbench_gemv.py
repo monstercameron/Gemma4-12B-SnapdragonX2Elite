@@ -89,7 +89,9 @@ def bench(K, N, level, wgs, split):
 
 for name, (K, N) in DIMS.items():
     print(f"\n=== {name} ===", flush=True)
-    for lvl, lab in [(0, "L0 load-only (ceiling)"), (1, "L1 +unpack"), (2, "L2 +scale"), (3, "L3 full GEMV")]:
+    # NB: L3 sums only 2 of the 8 packed nibbles (a bandwidth probe -- the full u32 is still read, so
+    # GB/s is valid, but it is NOT the full kernel's ALU). microbench_total.py does the full 8-lane GEMV.
+    for lvl, lab in [(0, "L0 load-only (ceiling)"), (1, "L1 +unpack"), (2, "L2 +scale"), (3, "L3 GEMV (2/8 lanes)")]:
         ms, gb = bench(K, N, lvl, 128, 8)
         print(f"  {lab:24} {ms:7.3f} ms  {gb:6.1f} GB/s", flush=True)
     print("  -- full-GEMV split sweep (WGS=64) --", flush=True)
