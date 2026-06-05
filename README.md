@@ -13,7 +13,7 @@ context — built without ONNX Runtime, llama.cpp, or Qualcomm's QNN/litert tool
 | | throughput | bound by |
 |---|---|---|
 | **Decode** (generation) | **~13 tok/s** | memory bandwidth (~106 of ~123 GB/s achievable) |
-| **Prefill** (prompt processing) | **~61 prompt-tok/s** | compute (on the GPU's cooperative-matrix cores) |
+| **Prefill** (prompt processing) | **~61 prompt-tok/s** (f16 coopmat) · **~2× with `PREFILL_I8=1`** (int8 coopmat) | compute (on the GPU's cooperative-matrix cores) |
 | Context | up to **64k** tokens | sliding-window ring buffer + flash attention |
 
 How it compares on the same machine (decode tok/s): this engine **~13** · llama.cpp CPU 7.9 ·
@@ -74,6 +74,9 @@ $env:PROFILE=1; .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
 # opt-in fp8 (e4m3) decode scales: +4.5-8% decode for a ~2%/scale quantization cost
 $env:GEMV_FP8=1; .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
 
+# opt-in W8A8 int8 prefill GEMMs: ~2x prefill, at the cost of ~12GB extra weight RAM
+$env:PREFILL_I8=1; .venv-gemma4\Scripts\python.exe src\serve.py
+
 # a microbenchmark
 .venv-gemma4\Scripts\python.exe benchmarks\microbench_gemv.py
 ```
@@ -83,6 +86,15 @@ halving the ~11% of decode bandwidth they cost. Scales are normalized per-tensor
 into e4m3's normal range so quality holds (needle retrieval intact, decoded text
 unchanged); default is fp16 for zero quality risk. Prefill always keeps fp16
 scales — it's compute-bound, so fp8 would not help it.
+
+`PREFILL_I8=1` runs the prefill GEMMs through the Adreno's int8 cooperative-matrix
+engine (3.7× the f16 path here) instead of fp16: precomputed int8 weights (per-
+column scale, the int4 per-block scale folded in at load) × per-row int8-quantized
+activations → s8×s8→s32 → rescale. Measured **~2.0× prefill** (105 → 210 prompt-tok/s
+GPU-only) at identical quality (microbench cos 0.99993 vs the f16 path; needle intact).
+Cost: ~12GB extra weight RAM (int8 stored alongside int4 — decode keeps int4 for its
+bandwidth). Default off; decode is unaffected. Validate the speed/quality yourself with
+`benchmarks\coopgemm_w4a8.py` (no model load).
 
 Point any OpenAI client at the server:
 
