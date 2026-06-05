@@ -49,7 +49,8 @@ def memtype(bits):
     for i in range(memp.memoryTypeCount):
         if (bits & (1 << i)) and (memp.memoryTypes[i].propertyFlags & HV) == HV: return i
     raise RuntimeError("no HV mem")
-USAGE = vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+USAGE = (vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | vk.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+         | vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | vk.VK_BUFFER_USAGE_TRANSFER_DST_BIT)  # transfer: KV prefix-cache copies
 
 class Buf:
     __slots__ = ("buf", "mem", "size")
@@ -421,6 +422,41 @@ for gi in range(ngrp):
     vk.vkEndCommandBuffer(C)
 print(f"[rec] prefill command buffers recorded ({ngrp} groups of <={GLAY} layers)", flush=True)
 
+# ---------- prefix KV cache: snapshot/restore the shared-prefix KV so repeated prompts skip re-prefill.
+# Global layers (linear) snapshot slots 0..CACHE_MAX-1 per kv-head; sliding layers snapshot the whole
+# ring. Copying CACHE_MAX slots unconditionally is safe: on reuse we resume at the cached length Pa, so
+# slots >= Pa are either overwritten by the resumed prefill or causally masked. Records two command
+# buffers (snapshot kc/vc -> side buffers, and restore) once; submitted on demand. ----------
+CACHE_MAX = 2048                                    # max cached-prefix tokens (MC-aligned, <= CTX)
+_snap = []                                          # per-layer (snap_kc, snap_vc, regions)
+for L in layers:
+    hd = L["hd"]; nkv = L["nkv"]; win = L["win"]; stride = L["stride"]
+    depth = win if win > 0 else CACHE_MAX           # ring (sliding) vs CACHE_MAX slots (global)
+    sz = nkv * depth * hd * 2
+    skc = Buf(sz); svc = Buf(sz)
+    if win > 0:                                     # sliding: whole ring is contiguous -> one region
+        regions = [vk.VkBufferCopy(srcOffset=0, dstOffset=0, size=sz)]
+    else:                                           # global: per-kv-head slice of the first CACHE_MAX slots
+        regions = [vk.VkBufferCopy(srcOffset=i * stride * hd * 2, dstOffset=i * depth * hd * 2, size=depth * hd * 2)
+                   for i in range(nkv)]
+    _snap.append((skc, svc, regions))
+
+def _rec_copy(invert):   # invert=False: kc/vc -> snap (snapshot); True: snap -> kc/vc (restore)
+    C = vk.vkAllocateCommandBuffers(dev, vk.VkCommandBufferAllocateInfo(commandPool=cpool,
+        level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=1))[0]
+    vk.vkBeginCommandBuffer(C, vk.VkCommandBufferBeginInfo())
+    for L, (skc, svc, regions) in zip(layers, _snap):
+        for live, snap in ((L["kc"], skc), (L["vc"], svc)):
+            src, dst = (snap, live) if invert else (live, snap)
+            vk.vkCmdCopyBuffer(C, src.buf, dst.buf, len(regions), regions)
+    vk.vkEndCommandBuffer(C); return C
+_cb_snap = _rec_copy(False); _cb_restore = _rec_copy(True)
+
+def _kv_copy(C):   # submit a pre-recorded copy command buffer and wait
+    vk.vkResetFences(dev, 1, [fence])
+    vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[C])], fence)
+    vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+
 def set_rope_batch(p0, M):
     posids = torch.arange(p0, p0 + M).reshape(1, M)
     for lt in ("sliding_attention", "full_attention"):
@@ -472,15 +508,20 @@ def sample(logits, temperature=0.0, top_p=1.0):
     return int(np.random.choice(p.shape[0], p=p))
 
 
-def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=()):
-    """Prefill `ids` then yield generated token ids one at a time (greedy or sampled). Each call
-    starts at pos=0 so the KV cache (slots 0..pos) is overwritten cleanly -- no cross-request state.
+def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_chunks=0, snap_chunks=0):
+    """Prefill `ids` then yield generated token ids one at a time (greedy or sampled).
+    Prefix KV cache: `reuse_chunks` skips the first N prefill chunks (their KV is restored from the
+    snapshot); `snap_chunks` snapshots the first N chunks' KV after prefilling them (for later reuse).
     The fixed command buffer caps total context at MAXT; the prompt is left-truncated to fit."""
     ids = [int(i) for i in ids]
     if not ids: return   # empty prompt -> nothing to generate (avoids sample(None) crash)
-    if len(ids) >= MAXT: ids = ids[-(MAXT - 1):]
+    if len(ids) >= MAXT: ids = ids[-(MAXT - 1):]; reuse_chunks = snap_chunks = 0   # truncation breaks prefix alignment
     n = len(ids); nfull = (n - 1) // MC if n > MC else 0   # full MC-chunks among tokens 0..n-2
-    for c in range(nfull): forward_prefill(ids[c * MC:(c + 1) * MC], c * MC)   # batched prefill
+    reuse_chunks = min(reuse_chunks, nfull); snap_chunks = min(snap_chunks, nfull, CACHE_MAX // MC)
+    if reuse_chunks > 0: _kv_copy(_cb_restore)                 # restore cached-prefix KV; skip its chunks
+    for c in range(reuse_chunks, nfull):
+        forward_prefill(ids[c * MC:(c + 1) * MC], c * MC)      # batched prefill
+        if c + 1 == snap_chunks: _kv_copy(_cb_snap)            # snapshot the shared-prefix KV
     logits = None
     for pos in range(nfull * MC, n): logits = forward(ids[pos], pos)           # tail + last via decode
     pos = n

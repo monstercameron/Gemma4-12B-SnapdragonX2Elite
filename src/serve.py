@@ -72,24 +72,53 @@ def _stops(stop) -> List[str]:
 def _fit(prompt_len: int, req_max: Optional[int]) -> int:
     return max(1, min(req_max or 256, E.MAXT - prompt_len))
 
+# Prefix KV cache: the engine snapshots a shared prompt prefix's KV so repeated prompts skip
+# re-prefilling it. We auto-detect the prefix as the chunk-aligned longest-common-prefix of consecutive
+# requests (typically the system prompt). Reuse is allowed only at the EXACT cached length so the
+# sliding-window ring is clean. A lock serializes generations (the single-GPU engine is not reentrant).
+_gen_lock = threading.Lock()
+_pref_cache = {"ids": [], "chunks": 0}   # snapshot buffers currently hold this prefix's KV
+_prev_ids: list = []
+
 def _run(ids, max_new, temperature, top_p, stop_strs):
     """Yield (delta_text, finish_reason, n_tokens). finish_reason is None until the final yield.
     Decodes the whole running id list each step so sentencepiece spacing is correct; trims at stop
     strings. n_tokens is the real count of tokens the engine produced (for accurate usage)."""
-    gen_ids, prev, n = [], "", 0
-    for tid in E.generate(ids, max_new, temperature, top_p, STOP_IDS):
-        n += 1; gen_ids.append(tid)
-        text = E.tok.decode(gen_ids)
-        cut = min([text.find(s) for s in stop_strs if s and text.find(s) != -1], default=-1)
-        if cut != -1:
-            d = text[:cut][len(prev):]
+    global _prev_ids
+    with _gen_lock:
+        MC = E.MC; CMAX = E.CACHE_MAX // MC
+        n_ids = len(ids); nfull = (n_ids - 1) // MC if n_ids > MC else 0
+        ck = _pref_cache["chunks"]
+        reuse = ck if (0 < ck <= nfull and ids[:ck * MC] == _pref_cache["ids"]) else 0
+        lcp = 0
+        for a, b in zip(ids, _prev_ids):
+            if a != b: break
+            lcp += 1
+        snap = min(lcp // MC, nfull, CMAX)
+        snap_arg = snap if snap > reuse else 0   # (re)snapshot only when extending past the reused prefix
+        _prev_ids = list(ids)
+        gen = E.generate(ids, max_new, temperature, top_p, STOP_IDS, reuse_chunks=reuse, snap_chunks=snap_arg)
+        _done = object(); first = next(gen, _done)   # runs prefill (incl. snapshot) + first decode token
+        if snap_arg: _pref_cache.update(ids=ids[:snap_arg * MC], chunks=snap_arg)   # snapshot now committed
+
+        def _toks():
+            if first is not _done:
+                yield first
+                yield from gen
+        gen_ids, prev, n = [], "", 0
+        for tid in _toks():
+            n += 1; gen_ids.append(tid)
+            text = E.tok.decode(gen_ids)
+            cut = min([text.find(s) for s in stop_strs if s and text.find(s) != -1], default=-1)
+            if cut != -1:
+                d = text[:cut][len(prev):]
+                if d: yield d, None, n
+                yield "", "stop", n; return
+            d = text[len(prev):]; prev = text
             if d: yield d, None, n
-            yield "", "stop", n; return
-        d = text[len(prev):]; prev = text
-        if d: yield d, None, n
-    # OpenAI counts the stopping EOS token in completion_tokens; the engine consumes it without
-    # yielding, so +1 when we stopped on a stop token (n < max_new) rather than hitting the length cap.
-    yield "", ("length" if n >= max_new else "stop"), (n if n >= max_new else n + 1)
+        # OpenAI counts the stopping EOS token in completion_tokens; the engine consumes it without
+        # yielding, so +1 when we stopped on a stop token (n < max_new) rather than hitting the length cap.
+        yield "", ("length" if n >= max_new else "stop"), (n if n >= max_new else n + 1)
 
 
 # ---------- routes ----------
