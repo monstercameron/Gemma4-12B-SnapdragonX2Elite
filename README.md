@@ -112,7 +112,7 @@ two requests. Measured ~26-29% lower latency on a 505-token shared system prompt
 
 | Endpoint | What |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming, `usage`) |
+| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming, `usage`, **tool/function calling** via Gemma's native tool format — works with agent clients like opencode) |
 | `POST /v1/completions` | OpenAI legacy completions |
 | `POST /v1/responses` | OpenAI **Responses API** (text) — `input`/`output` shape, typed SSE streaming, and the spec's stateful path (`store` + `previous_response_id`). No native tools/multimodal (text-only engine) |
 | `WS /v1/sessions` | **Stateful session** over one WebSocket — server keeps the conversation, client sends only the next message; multi-turn rides the prefix KV cache. `configure` / `message` → `response.delta` / `response.done` |
