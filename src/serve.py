@@ -4,14 +4,14 @@ Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/comp
 (streaming + non-streaming). The engine holds one global GPU command buffer + KV cache, so all
 generation is serialized behind a single lock -- correct for a local single-GPU server.
 
-Run:  .venv-gemma4/Scripts/python.exe scripts/serve.py [--host H] [--port P]
+Run:  .venv-gemma4/Scripts/python.exe src/serve.py [--host H] [--port P]
 Import of vk_engine loads the model + records the command buffer (~minutes) at startup.
 """
 import os, sys, time, json, uuid, threading, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from typing import Optional, Union, List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
@@ -87,7 +87,9 @@ def _run(ids, max_new, temperature, top_p, stop_strs):
             yield "", "stop", n; return
         d = text[len(prev):]; prev = text
         if d: yield d, None, n
-    yield "", ("length" if n >= max_new else "stop"), n
+    # OpenAI counts the stopping EOS token in completion_tokens; the engine consumes it without
+    # yielding, so +1 when we stopped on a stop token (n < max_new) rather than hitting the length cap.
+    yield "", ("length" if n >= max_new else "stop"), (n if n >= max_new else n + 1)
 
 
 # ---------- routes ----------

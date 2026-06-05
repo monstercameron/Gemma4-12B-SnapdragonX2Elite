@@ -13,7 +13,7 @@ Run under the QNN venv for NPU, or any onnxruntime for CPU:
   <pipeline>/.venv/Scripts/python.exe scripts/engine_gemma.py --backend npu "The capital of France is" --ngen 8
   .venv-gemma4/Scripts/python.exe   scripts/engine_gemma.py --backend cpu "..." --ngen 8
 """
-import os, sys, time, glob, gc, json, argparse
+import os, time, gc, json, argparse
 import numpy as np
 import onnxruntime as ort
 

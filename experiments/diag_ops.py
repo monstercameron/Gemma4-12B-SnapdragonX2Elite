@@ -4,7 +4,7 @@ internal op outputs and compares CPU vs HTP at each — the FIRST divergent op i
 
 Run (QNN venv): PYTHONPATH=scripts <pipeline>/.venv/Scripts/python.exe scripts/diag_ops.py
 """
-import os, numpy as np, onnx, onnxruntime as ort
+import numpy as np, onnx, onnxruntime as ort
 from engine_gemma import ShardEngine
 
 DEC = "out/gemma4_decomp"; WIN, H = 64, 3840

@@ -10,7 +10,7 @@ Goals:
 Run:
   .venv-gemma4/Scripts/python.exe scripts/ref_run.py
 """
-import os, sys, time, json
+import os, time, json
 import numpy as np
 
 MODEL = "models/gemma-4-12B-it"

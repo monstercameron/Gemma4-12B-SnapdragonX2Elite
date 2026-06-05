@@ -78,17 +78,16 @@ def pipe(mod, lay):
         stage=vk.VkPipelineShaderStageCreateInfo(stage=vk.VK_SHADER_STAGE_COMPUTE_BIT, module=mod, pName="main"),
         layout=pl)], None)[0]
     return p, pl
-LG, LR, LN, LS, LP, LA = layout(4,1), layout(2,1), layout(3,1), layout(1,1), layout(6,2), layout(7,2)
+LG, LR, LN, LP, LA = layout(4,1), layout(2,1), layout(3,1), layout(6,2), layout(7,2)
 P_gemv, PLg = pipe(spv("gemv.spv"), LG); P_red, PLr = pipe(spv("reduce.spv"), LR)
 P_norm, PLn = pipe(spv("rmsnorm.spv"), LN); P_na, _ = pipe(spv("normadd.spv"), LN)
-P_gm, _ = pipe(spv("gelumul.spv"), LN); P_sc, PLs = pipe(spv("softcap.spv"), LS)
+P_gm, _ = pipe(spv("gelumul.spv"), LN)   # softcap is applied CPU-side in sample(); no GPU softcap kernel
 P_prep, PLp = pipe(spv("prepkv.spv"), LP); P_attn, PLa = pipe(spv("attn.spv"), LA)
 # batched-prefill pipelines (reuse layouts: gemm=LG, pre_norm/pre_na=LN, pre_prepkv/pre_attn=LA)
-P_gemm, PLgm = pipe(spv("gemm.spv"), LG); P_pn, PLpn = pipe(spv("pre_norm.spv"), LN)
+P_pn, PLpn = pipe(spv("pre_norm.spv"), LN)
 P_pna, _ = pipe(spv("pre_na.spv"), LN); P_ppk, PLap = pipe(spv("pre_prepkv.spv"), LA)
 P_pat, _ = pipe(spv("pre_attn.spv"), LA)
-P_cgemm, PLcg = pipe(spv("coopgemm_i4f.spv"), LG)   # fp32 int4 coopmat GEMM (matrix cores) for prefill
-P_cgemm16, _ = pipe(spv("coopgemm_i4h.spv"), LG)    # fp16 int4 coopmat GEMM (~1.5x; K=16 tiles)
+P_cgemm16, PLcg = pipe(spv("coopgemm_i4h.spv"), LG)  # fp16 int4 coopmat GEMM (matrix cores) for prefill
 P_castdn, PLca = pipe(spv("cast_dn.spv"), LR)       # f32->f16 (LR = 2 storage + 1 uniform)
 P_castup, _ = pipe(spv("cast_up.spv"), LR)          # f16->f32
 
@@ -177,7 +176,7 @@ lmh = i4(model.lm_head); finw = wbuf(tm.norm.weight.detach().float().numpy())
 print(f"[load] done {time.time()-t0:.0f}s; building command buffer...", flush=True)
 
 # ---------- descriptor sets + command recording ----------
-DUH = buf_u32([H, 0, 0, 0]); DUI = buf_u32([I, 0, 0, 0]); DUV = buf_u32([V, 0, 0, 0])
+DUH = buf_u32([H, 0, 0, 0]); DUI = buf_u32([I, 0, 0, 0])
 def gemv_ds(qw, inbuf, outbuf, out_off=0):
     (bw, bs, split, nblk), (N, K) = qw
     d1 = buf_u32([N, N // 8, nblk // split, BLK])
@@ -215,8 +214,6 @@ for L in layers:
     L["d_nas"] = ds(LN, [(B["down"].buf, H * 4), (L["ofw"].buf, H * 4), (B["h"].buf, H * 4)], [(nasu.buf, 16)])
 d_fin = normbg(B["h"], finw, B["normed_f"], DUH)
 d_lm = gemv_ds(lmh, B["normed_f"], B["logits"], 0)
-capu = buf_u32([V, int(np.array([softcap], np.float32).view(np.uint32)[0]), 0, 0])
-d_cap = ds(LS, [(B["logits"].buf, V * 4)], [(capu.buf, 16)])
 
 # ---------- record ONE command buffer ----------
 cpool = vk.vkCreateCommandPool(dev, vk.VkCommandPoolCreateInfo(queueFamilyIndex=qfi), None)
@@ -252,8 +249,8 @@ for L in layers:
     gemv(L["d_g"]); gemv(L["d_u"]); ts("gate_up"); disp(P_gm, PLn, L["d_gm"], (I + 63) // 64); ts("gelu")
     gemv(L["d_d"]); ts("down"); disp(P_na, PLn, L["d_nas"], 1); ts("normadd")
 disp(P_norm, PLn, d_fin, 1); ts("norm"); gemv(d_lm); ts("lm_head")
-# softcap (cap*tanh(x/cap)) is monotonic -> argmax(softcap(logits))==argmax(logits); skip it for
-# greedy decode. (Re-enable disp(P_sc, PLs, d_cap, (V+63)//64) if sampling/temperature is added.)
+# no GPU softcap: cap*tanh(x/cap) is monotonic so argmax(softcap)==argmax for greedy decode, and
+# sample() applies final-logit softcapping CPU-side for temperature/top-p. So logits stay raw here.
 vk.vkEndCommandBuffer(cb)
 print("[rec] command buffer recorded; running inference...", flush=True)
 
@@ -294,7 +291,7 @@ def print_profile():
 
 # ================= BATCHED PREFILL (additive: builds KV for a chunk of MC tokens at once so each
 # weight is read once instead of MC times -> ~10x faster prompt processing. Decode path untouched). =
-MC = 128; GMT = 8                       # chunk size; tokens/GEMM-thread (must match gemm.comp MT)
+MC = 128                                # prefill chunk size (tokens processed per coopmat GEMM pass)
 nqM = nH * 512; nkM = 8 * 256
 Xp = fb(MC * H); Np = fb(MC * H); Tp = fb(MC * H)
 Qp = fb(MC * nqM); Ap = fb(MC * nqM); Kp = fb(MC * nkM); Vp = fb(MC * nkM)

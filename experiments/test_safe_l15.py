@@ -1,4 +1,4 @@
-import os, numpy as np, onnxruntime as ort
+import numpy as np, onnxruntime as ort
 from engine_gemma import ShardEngine
 DEC="out/gemma4_decomp"; WIN,H=64,3840
 import onnxruntime_qnn as q

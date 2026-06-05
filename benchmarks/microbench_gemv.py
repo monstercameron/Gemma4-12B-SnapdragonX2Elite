@@ -9,7 +9,7 @@ Components (each strips one layer of work):
   L3 full GEMV   : + (q-8)*scale*x accumulate (real kernel)
 Then sweep WGS in {64,128,256} and split in {4,8,16} on the full kernel.
 """
-import sys, time, numpy as np, wgpu
+import time, numpy as np, wgpu
 
 # representative dims: down_proj (big K) and gate_proj (big N)
 DIMS = {"down K15360 N3840": (15360, 3840), "gate K3840 N15360": (3840, 15360),

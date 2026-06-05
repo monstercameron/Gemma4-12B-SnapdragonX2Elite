@@ -22,7 +22,7 @@ Full export (after weights download):
   .venv-gemma4/Scripts/python.exe scripts/export_shards.py --model models/gemma-4-12B-it \
       --out out/gemma4_fp16 --layers-per-shard 4 --win 64
 """
-import os, sys, argparse, glob, json, time
+import os, sys, argparse, json, time
 import numpy as np
 import torch
 from torch import nn

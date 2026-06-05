@@ -1,7 +1,7 @@
 """Find the remaining overflow op inside safe2 shard 3 (layers 12-15). Feed the REAL input
 (CPU trace[2]) and expose per-layer matmuls + residual boundaries; first inf/huge on HTP is
 the culprit. Tries single-token AND a filled-KV stress to trigger the multi-token NaN."""
-import os, numpy as np, onnx, onnxruntime as ort
+import numpy as np, onnx, onnxruntime as ort
 from engine_gemma import ShardEngine
 SH = "out/gemma4_fp16_safe2/fp16shard_3.onnx"; WIN, H = 64, 3840
 

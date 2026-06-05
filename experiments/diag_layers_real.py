@@ -6,7 +6,7 @@ tensors to find the exact op.
 
 Run (QNN venv): PYTHONPATH=scripts <pipeline>/.venv/Scripts/python.exe scripts/diag_layers_real.py
 """
-import os, json, numpy as np, onnx, onnxruntime as ort
+import os, numpy as np, onnx, onnxruntime as ort
 from engine_gemma import ShardEngine
 
 DEC = "out/gemma4_decomp"

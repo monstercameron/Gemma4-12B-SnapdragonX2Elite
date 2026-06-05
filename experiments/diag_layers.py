@@ -5,7 +5,7 @@
 
 Run (QNN venv): <pipeline>/.venv/Scripts/python.exe scripts/diag_layers.py
 """
-import os, json, numpy as np, onnxruntime as ort
+import os, numpy as np, onnxruntime as ort
 
 DIR = "out/gemma4_decomp"
 WIN, H = 64, 3840
