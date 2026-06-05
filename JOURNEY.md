@@ -14,12 +14,15 @@ Gemma 4 12B decode speed, this laptop:
   llama.cpp Vulkan            6.06 tok/s
   custom wgpu shader engine   7.07 tok/s
   llama.cpp CPU               7.9  tok/s
-  ► custom RAW VULKAN engine  11.04 tok/s   ← final result, beats everything
+  ► custom RAW VULKAN engine  13.84 tok/s   ← final result, beats everything
 ```
 
-A **~460× speedup** from the first working number, ending **+40% faster than llama.cpp CPU** —
+A **~577× speedup** from the first working number, ending **+75% faster than llama.cpp CPU** —
 every kernel measured and rebuilt from microbenchmark data, then driven by a command buffer
-recorded once and resubmitted per token.
+recorded once and resubmitted per token. Beyond decode: **prefill mega-optimized to ~210 prompt-tok/s
+(2.2×)** via fp16 KV + an int8 cooperative-matrix GEMM, a **64k context**, an **OpenAI-compatible
+server** with **transparent prefix KV caching**, and opt-in fp8 decode scales — each landed (or
+declined) on measured evidence.
 
 ---
 
@@ -447,6 +450,79 @@ wins are quantization-level (fewer/smaller bytes), not kernel micro-opts.
 
 ---
 
+## Phase 14 — Decode at the bandwidth wall: fp8 scales (opt-in)
+
+The Phase-13 profile settled that decode is 94.5% GEMV weight reads at the bandwidth wall, with one
+sub-weight lever: the per-block fp16 **scales** (~11% of GEMV bytes). Shipped it opt-in:
+
+- **`GEMV_FP8=1`** stores the int4 per-block scales as fp8 e4m3 (1 byte vs fp16's 2). Naive e4m3 lands
+  the ~0.01-magnitude scales in the *subnormal* range (precision collapse); fixed with a **per-tensor
+  power-of-2 normalization** into e4m3's normal band [2⁻⁶,448], the inverse folded into the GEMV output.
+  Shader decode verified bit-exact vs torch's encoder (≤2.34%/scale over an 80× spread).
+- A/B (interleaved best-of-2, 128-tok bursts): **+4.5–8% decode**, fp8 won both rounds; needle retrieved,
+  decoded text identical. Flag-gated, default fp16 (zero quality risk).
+
+A full GLSL Adreno-fit pass alongside it: **gemv `vec4` partial stores** (16 scalar → 4 wide, kept), and
+**subgroup-arithmetic reductions** in attention — compiled clean but produced **non-finite logits** on
+this Adreno, so reverted (<1% decode impact anyway). Measure, don't assume.
+
+## Phase 15 — Prefill, mega-optimized: fp16 KV + W8A8 int8 coopmat (~2×)
+
+A `PREPROF=1` per-kernel prefill profiler (timestamps in the batched-prefill graph) gave ground truth:
+**attn 30%, GEMMs 66%, casts 2%**. Two real wins; the GEMM micro-opt that *looked* obvious was a trap.
+
+- **dequant-hoist — reverted.** The coopmat GEMM re-dequantizes each weight tile once per M-row-tile;
+  hoisting it (2 accumulators sharing one dequant) *regressed* prefill 95→84 prompt-tok/s — two 64×64 f16
+  accumulators spill registers and collapse occupancy. The GEMMs are **occupancy/matrix-core-bound, not
+  dequant-bound.**
+- **fp16 KV cache — +10.5%, default on.** Prefill attention re-streams the whole K/V cache once per query
+  token; the reads are L2-absorbed but still cost transaction bandwidth. fp16 storage (was f32) halves
+  them: prefill 95→105 prompt-tok/s, **attention 30%→18% (−45%)**, and **2× the reachable 64k context**
+  (KV memory halved). K (post-norm/RoPE) and V are O(1) → fp16 lossless; dots still accumulate f32.
+- **W8A8 int8 coopmat GEMM — ~2×, `PREFILL_I8=1`.** A no-model-load microbench (`benchmarks/coopgemm_i8.py`)
+  found the Adreno's **int8 coopmat is 3.7× the f16 path** (s8×s8→s32, K=32 tile vs f16 K=16), and the
+  prefill GEMMs (77%) used f16. Two routes, both de-risked in `benchmarks/coopgemm_w4a8.py`:
+  - **W4A8** (int4 weight + on-the-fly int8 requant): no extra RAM, but the per-element float-mul+round
+    requant dominates → **0.27× (4× slower)**. Documented dead end.
+  - **W8A8** (precomputed int8 weights, per-column scale — the int4 per-block scale folded in at load):
+    pure int8 matmul + one final rescale → **10273 GFLOP/s, 2.78× the f16 path, cos 0.99993** (int8
+    activations essentially free). Costs 2× weight RAM (int8 alongside int4; decode keeps int4).
+  - **Integrated** (`cast_i8` per-row int8 activation quant → `coopgemm_w8a8` → rescale): measured
+    **prefill 105 → 209.8 prompt-tok/s (2.0×)**; GEMMs qkv 4.4×, down 3.6×, o 3.3×, gateup 2.2×. Needle
+    retrieved, text correct. ~12 GB extra RAM (fits 48 GB), flag-gated, decode untouched.
+
+**Net prefill: 95 → 210 prompt-tok/s (2.2×) at identical quality.**
+
+## Phase 16 — Transparent prefix KV cache (server)
+
+A shared prompt prefix (system prompt, or a growing multi-turn conversation) produces identical KV every
+request, but the engine re-prefilled it each time. Added **prefix KV caching** — the mechanism behind
+"OpenAI-style prompt caching":
+
+- The engine snapshots a prefix's KV (global layers: first `CACHE_MAX=2048` slots/kv-head; sliding layers:
+  the whole ring) into side buffers, and **restores it with a ~ms GPU copy** instead of recomputing (vs
+  *seconds* to re-prefill). `generate(reuse_chunks, snap_chunks)` skips/snapshots the first N prefill chunks.
+- `serve.py` auto-detects the prefix as the chunk-aligned longest-common-prefix of consecutive requests;
+  reuses **only at the exact cached length** so the sliding-window ring stays clean. A generation lock
+  serializes requests (single-GPU engine isn't reentrant — also fixed a latent concurrency bug).
+- **Correctness:** `test_prefix_cache.py` — a reused-prefix request yields **byte-identical** tokens to a
+  cold full-prefill. **Live:** **−26–29% latency** on a 505-token shared system prompt; longer prefixes
+  save proportionally more. Transparent (no API change), warms up after 2 requests.
+
+## Phase 17 — Speculative decoding & MTP: measured dead ends
+
+Two decode accelerators evaluated and **correctly declined**, with data not vibes:
+
+- **MTP (multi-token prediction):** the Gemma-4 config has no MTP/nextn heads (standard NTP, tied lm_head)
+  — self-speculation needs trained draft heads the model doesn't have.
+- **Prompt-lookup speculative decoding:** decode is bandwidth-bound and the only M>1 verify path is the
+  prefill chunk, costing ~8 (int8) / ~16 (f16) decode-tokens. Measured acceptance on real generations
+  (`benchmarks/spec_acceptance.py`): **echo 9.3 tok/step (marginal), code 3.1 (loss), chat 1.2 (big loss)**.
+  Only contrived verbatim echo clears the bar. A draft model would raise acceptance but needs a second
+  model. **Not built** — the measurement says it'd be net-negative for real use.
+
+---
+
 ## Final standings
 
 | Path | Correct? | Decode tok/s |
@@ -495,9 +571,15 @@ wins are quantization-level (fewer/smaller bytes), not kernel micro-opts.
 ## Run it
 
 ```powershell
-# fastest custom path (~11 tok/s):
-.venv-gemma4\Scripts\python.exe scripts\vk_engine.py 8
+# custom raw-Vulkan engine (~13.8 tok/s decode):
+.venv-gemma4\Scripts\python.exe src\vk_engine.py 8
 
-# deployable baseline (~7.9 tok/s CPU, OpenAI server):
-llama.cpp\build-adreno\bin\llama-server.exe -m gguf\gemma-4-12b-it-UD-Q4_K_XL.gguf -ngl 0 --port 8080
+# OpenAI-compatible server (transparent prefix KV cache; auto on repeated prompts):
+.venv-gemma4\Scripts\python.exe src\serve.py --host 127.0.0.1 --port 8000
+
+# opt-in: fp8 decode scales (+4.5-8% decode) / int8 prefill GEMMs (~2x prefill, +12GB RAM):
+$env:GEMV_FP8=1;   .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
+$env:PREFILL_I8=1; .venv-gemma4\Scripts\python.exe src\serve.py
+
+# per-kernel GPU profilers: PROFILE=1 (decode), PREPROF=1 (batched prefill)
 ```

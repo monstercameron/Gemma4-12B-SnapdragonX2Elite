@@ -25,10 +25,15 @@ custom wgpu 7.07 · llama.cpp Vulkan 6.06 · the ONNX/QNN starting point 0.024.
   occupancy + a record-once Vulkan command buffer (one submit per token, no per-token re-encode).
 - **64k context** via flash-decode attention (online softmax, unbounded T) and a sliding-window ring
   buffer for the local-attention layers — fits in 48 GB unified memory.
-- **Batched prefill on the matrix cores** — `VK_KHR_cooperative_matrix` fp16 GEMM with an in-kernel
-  int4→fp16 dequant, ~4.7× faster prompt processing than per-token prefill.
-- **OpenAI-compatible server** (`/v1/chat/completions` streaming + non-streaming, validated against the
-  official `openai` Python client).
+- **Batched prefill on the matrix cores** — `VK_KHR_cooperative_matrix` GEMM with an in-kernel int4
+  dequant; ~4.7× faster than per-token prefill on the fp16 path, **~2× more again with `PREFILL_I8=1`**
+  (the Adreno's int8 coopmat is 3.7× the f16 path; W8A8 with the per-block scale folded into precomputed
+  int8 weights — cos 0.99993, validated in `benchmarks/coopgemm_w4a8.py`).
+- **fp16 KV cache** — halves attention read traffic (prefill attn −45%) and **doubles the reachable 64k
+  context**; K/V are O(1) so it's lossless in practice.
+- **OpenAI-compatible server** with **transparent prefix KV caching** — repeated prompts (shared system
+  prompt / multi-turn) reuse the prefix's KV via a ~ms GPU copy instead of re-prefilling it (−26–29%
+  latency); streaming + non-streaming, validated against the official `openai` client.
 - **A real GPU profiler** built in (`PROFILE=1`, Vulkan timestamp queries) — per-kernel timing that
   shows decode is 94.5% GEMV weight reads, i.e. bandwidth-bound at the hardware ceiling.
 
@@ -37,8 +42,9 @@ custom wgpu 7.07 · llama.cpp Vulkan 6.06 · the ONNX/QNN starting point 0.024.
 ```
 src/            the engine + server
   vk_engine.py    the raw-Vulkan int4 engine (decode + batched prefill + 64k + profiler)
-  serve.py        OpenAI-compatible FastAPI server
+  serve.py        OpenAI-compatible FastAPI server (+ transparent prefix KV cache)
   test_longctx.py long-context needle-in-haystack test
+  test_prefix_cache.py  prefix-cache correctness test (reuse == cold, byte-identical)
 vk/             GLSL compute shaders (.comp) + compiled SPIR-V (.spv) + build.sh
 benchmarks/     standalone microbenchmarks (kernel decomposition, coopmat, bandwidth, ...)
 experiments/    research path: the earlier ONNX/QNN shard pipeline + the WebGPU (wgpu) engine
