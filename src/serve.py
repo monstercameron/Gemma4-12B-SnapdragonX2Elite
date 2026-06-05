@@ -107,6 +107,16 @@ def _cache_commit(ids, snap_arg):
 # ---- tool calling: Gemma emits <|tool_call>(48) call:NAME{gemma-args} <tool_call|>(49). Parse that
 # span and convert Gemma's arg syntax (key:<|"|>val<|"|>) to JSON for OpenAI `tool_calls`. ----
 _TC_OPEN, _TC_CLOSE = 48, 49
+_CH_OPEN, _CH_CLOSE = 100, 101   # <|channel> .. <channel|> : Gemma's reasoning channel (keep out of content)
+
+def _visible_ids(ids):
+    """Drop reasoning-channel spans so the channel label/thought text never leaks into content."""
+    out, inch = [], False
+    for t in ids:
+        if t == _CH_OPEN: inch = True
+        elif t == _CH_CLOSE: inch = False
+        elif not inch: out.append(t)
+    return out
 
 def _gemma_args_to_json(argstr):
     s = argstr.replace('<|"|>', '"')                                  # Gemma string-quote token -> "
@@ -132,7 +142,7 @@ def _parse_tool_output(gen_ids):
             i = j + 1
         else:
             i += 1
-    seg = gen_ids if first is None else gen_ids[:first]
+    seg = _visible_ids(gen_ids if first is None else gen_ids[:first])
     content = (E.tok.decode(seg, skip_special_tokens=True).strip() or None) if seg else None
     return content, calls
 
@@ -150,10 +160,14 @@ def _run(ids, max_new, temperature, top_p, stop_strs):
             if first is not _done:
                 yield first
                 yield from gen
-        gen_ids, prev, n = [], "", 0
+        vis, prev, n, inch = [], "", 0, False
         for tid in _toks():
-            n += 1; gen_ids.append(tid)
-            text = E.tok.decode(gen_ids)
+            n += 1
+            if tid == _CH_OPEN: inch = True; continue          # suppress reasoning-channel content
+            if tid == _CH_CLOSE: inch = False; continue
+            if inch: continue
+            vis.append(tid)
+            text = E.tok.decode(vis)
             cut = min([text.find(s) for s in stop_strs if s and text.find(s) != -1], default=-1)
             if cut != -1:
                 d = text[:cut][len(prev):]
@@ -231,12 +245,16 @@ def _complete_tools(req, ids):
     if req.stream:
         def sse():
             yield f"data: {json.dumps(chunk({'role': 'assistant'}, None))}\n\n"
-            gen_ids, prev, comp_n, toolmode = [], "", 0, False
+            gen_ids, vis, prev, comp_n, toolmode, inch = [], [], "", 0, False, False
             for tid in _run_tool(ids, max_new, req.temperature, req.top_p):
                 gen_ids.append(tid); comp_n = len(gen_ids)
                 if tid == _TC_OPEN: toolmode = True
                 if not toolmode:
-                    text = E.tok.decode(gen_ids, skip_special_tokens=True)
+                    if tid == _CH_OPEN: inch = True; continue
+                    if tid == _CH_CLOSE: inch = False; continue
+                    if inch: continue
+                    vis.append(tid)
+                    text = E.tok.decode(vis, skip_special_tokens=True)
                     d = text[len(prev):]; prev = text
                     if d: yield f"data: {json.dumps(chunk({'content': d}, None))}\n\n"
             _, calls = _parse_tool_output(gen_ids)
