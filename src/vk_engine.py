@@ -5,6 +5,7 @@ Run: .venv-gemma4/Scripts/python.exe scripts/vk_engine.py [ngen]
 """
 import os, sys, time, numpy as np, vulkan as vk, torch
 ffi = vk.ffi
+FP8 = os.environ.get("GEMV_FP8") == "1"  # A/B: fp8 e4m3 per-block scales (half scale traffic) vs fp16
 NGEN = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 6  # robust to importers
 BLK = 32; WIN = 1024; CTX = 65536; MAXT = CTX; MODEL = "models/gemma-4-12B-it"
 # 64k context: global (full) layers keep a CTX-deep KV; sliding layers keep only a WIN-deep ring
@@ -79,7 +80,7 @@ def pipe(mod, lay):
         layout=pl)], None)[0]
     return p, pl
 LG, LR, LN, LP, LA = layout(4,1), layout(2,1), layout(3,1), layout(6,2), layout(7,2)
-P_gemv, PLg = pipe(spv("gemv.spv"), LG); P_red, PLr = pipe(spv("reduce.spv"), LR)
+P_gemv, PLg = pipe(spv("gemv_fp8.spv" if FP8 else "gemv.spv"), LG); P_red, PLr = pipe(spv("reduce.spv"), LR)
 P_norm, PLn = pipe(spv("rmsnorm.spv"), LN); P_na, _ = pipe(spv("normadd.spv"), LN)
 P_gm, _ = pipe(spv("gelumul.spv"), LN)   # softcap is applied CPU-side in sample(); no GPU softcap kernel
 P_prep, PLp = pipe(spv("prepkv.spv"), LP); P_attn, PLa = pipe(spv("attn.spv"), LA)
@@ -114,7 +115,15 @@ def quant(W):  # [N,K] -> wpack buf, scales buf, split
     q = np.clip(np.round(Wb / sc[:, :, None]) + 8, 0, 15).astype(np.uint8).reshape(N, K)
     qT = np.ascontiguousarray(q.T); wp = np.zeros((K, N // 8), np.uint32)
     for j in range(8): wp |= (qT[:, j::8].astype(np.uint32) & 15) << (j * 4)
-    scb = np.ascontiguousarray(sc.T).astype(np.float16).reshape(-1).view(np.uint32)
+    scb16 = np.ascontiguousarray(sc.T).astype(np.float16).reshape(-1).view(np.uint32)  # fp16 (prefill coopmat)
+    inv = 1.0
+    if FP8:  # e4m3 decode scales: per-tensor power-of-2 lift into the normal range [2^-6,448], inverse folded in shader
+        mx = float(sc.max()); shift = int(np.floor(np.log2(256.0 / mx))) if mx > 0 else 0
+        sc_s = np.clip(sc * (2.0 ** shift), 0.0, 448.0)
+        e8 = torch.from_numpy(np.ascontiguousarray(sc_s.T)).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+        scb = e8.reshape(-1).view(np.uint32); inv = float(2.0 ** -shift)
+    else:
+        scb = scb16
     # measured (microbench_total.py, both passes): total time minimizes at ~384 total workgroups.
     # down(rows8)->48, gate(rows30)->12, qkv(rows10)->~24 all match. Huge-N lm_head (rows>=384)
     # naturally falls to split=1 (8.8ms) -- and MUST: split 2..30 is a catastrophic zone (~27ms).
@@ -125,7 +134,8 @@ def quant(W):  # [N,K] -> wpack buf, scales buf, split
     divs = [s for s in range(1, nblk + 1) if nblk % s == 0]
     split = min(divs, key=lambda s: (abs(s - want), s))
     bw = Buf(wp.nbytes); bw.write(wp.reshape(-1)); bs = Buf(scb.nbytes); bs.write(scb)
-    return bw, bs, split, nblk
+    bs16 = bs if not FP8 else (lambda b: (b.write(scb16), b)[1])(Buf(scb16.nbytes))  # prefill keeps fp16 scales
+    return bw, bs, split, nblk, inv, bs16
 
 # ---------- load model ----------
 import transformers
@@ -181,14 +191,16 @@ print(f"[load] done {time.time()-t0:.0f}s; building command buffer...", flush=Tr
 # ---------- descriptor sets + command recording ----------
 DUH = buf_u32([H, 0, 0, 0]); DUI = buf_u32([I, 0, 0, 0])
 def gemv_ds(qw, inbuf, outbuf, out_off=0):
-    (bw, bs, split, nblk), (N, K) = qw
-    d1 = buf_u32([N, N // 8, nblk // split, BLK])
+    (bw, bs, split, nblk, inv, _bs16), (N, K) = qw
+    # uniform: d=(N,nb8,bpc,blk); for fp8 also e.x=floatBits(inv) -> 8 u32, else 4. Same LG layout (range differs).
+    du = [N, N // 8, nblk // split, BLK] + ([int(np.float32(inv).view(np.uint32)), 0, 0, 0] if FP8 else [])
+    d1 = buf_u32(du); usz = 32 if FP8 else 16
     WGx = (N // 16 + 63) // 64   # uvec2 GEMV: 16 outputs/thread -> N/16 threads
     if split == 1:               # no reduction: GEMV writes straight to the output buffer, skip reduce
-        dp = ds(LG, [(inbuf.buf, K * 4), (bw.buf, bw.size), (bs.buf, bs.size), (outbuf.buf, N * 4, out_off)], [(d1.buf, 16)])
+        dp = ds(LG, [(inbuf.buf, K * 4), (bw.buf, bw.size), (bs.buf, bs.size), (outbuf.buf, N * 4, out_off)], [(d1.buf, usz)])
         return (dp, None, N, split, WGx)
     d2 = buf_u32([N, split, 0, 0])
-    dp = ds(LG, [(inbuf.buf, K * 4), (bw.buf, bw.size), (bs.buf, bs.size), (B["bp"].buf, split * N * 4)], [(d1.buf, 16)])
+    dp = ds(LG, [(inbuf.buf, K * 4), (bw.buf, bw.size), (bs.buf, bs.size), (B["bp"].buf, split * N * 4)], [(d1.buf, usz)])
     dr = ds(LR, [(B["bp"].buf, split * N * 4), (outbuf.buf, N * 4, out_off)], [(d2.buf, 16)])
     return (dp, dr, N, split, WGx)
 def normbg(inbuf, wb, outbuf, du):
@@ -306,10 +318,10 @@ DYNP = buf_u32([0, MC, 0, 0]); DUIp = buf_u32([MC * I, 0, 0, 0])
 
 def gemm_ds(qw, inbuf, outbuf):
     # fp16 coopmat GEMM: cast inbuf f32->f16 (Xf16), fp16 GEMM -> Yf16, cast Yf16 f16->f32 (outbuf).
-    (bw, bs, _s, _n), (N, K) = qw
+    (bw, _bs, _s, _n, _inv, bs16), (N, K) = qw  # prefill coopmat reads fp16 scales (bs16)
     u = buf_u32([N, K, MC, N // 8]); uin = buf_u32([MC * K, 0, 0, 0]); uout = buf_u32([MC * N, 0, 0, 0])
     cin = ds(LR, [(inbuf.buf, MC * K * 4), (Xf16.buf, MC * K * 2)], [(uin.buf, 16)])
-    gem = ds(LG, [(Xf16.buf, MC * K * 2), (bw.buf, bw.size), (bs.buf, bs.size), (Yf16.buf, MC * N * 2)], [(u.buf, 16)])
+    gem = ds(LG, [(Xf16.buf, MC * K * 2), (bw.buf, bw.size), (bs16.buf, bs16.size), (Yf16.buf, MC * N * 2)], [(u.buf, 16)])
     cout = ds(LR, [(Yf16.buf, MC * N * 2), (outbuf.buf, MC * N * 4)], [(uout.buf, 16)])
     return (cin, gem, cout, N, K)
 

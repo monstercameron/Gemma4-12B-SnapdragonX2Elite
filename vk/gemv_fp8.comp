@@ -1,0 +1,40 @@
+#version 450
+// fp8 (e4m3fn) per-block scales: half the scale-buffer bytes vs gemv.comp's fp16. Decode is bandwidth-
+// bound (~94% of decode is weight+scale reads); fp16 scales are ~11% of GEMV traffic, so halving them
+// is worth ~+5-6%. Scales are pre-normalized at quant time by a per-tensor power-of-2 (passed as
+// inv = 2^-shift) so every block sits in e4m3's normal range [2^-6,448]; the inverse is folded into the
+// output here. Weight path is byte-identical to gemv.comp (uvec2 int4, 16 outputs/thread, vec4 stores).
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Xb { float x[]; };
+layout(std430, binding=1) readonly  buffer Wb { uvec2 wpackT[]; };  // [K, N/16] uvec2 view of [K,N/8] u32
+layout(std430, binding=2) readonly  buffer Sb { uint  scalesT[]; }; // 4 e4m3 bytes per uint (was 2 fp16)
+layout(std430, binding=3) writeonly buffer Pb { vec4 partial[]; };  // vec4 view: 4 wide stores not 16 scalar
+layout(std140, binding=4) uniform Ub { uvec4 d; uvec4 e; };   // d=(N,nb8,bpc,blk)  e.x=floatBits(inv)
+// e4m3fn decode: 1 sign, 4 exp (bias 7), 3 mantissa. subnormal (exp==0): m*2^-9. normal: (1+m/8)*2^(e-7).
+float e4m3(uint b){
+  uint s=(b>>7)&1u; uint ex=(b>>3)&15u; uint m=b&7u;
+  float v = (ex==0u) ? float(m)*(1.0/512.0) : (1.0+float(m)*0.125)*exp2(float(ex)-7.0);
+  return (s==1u) ? -v : v;
+}
+vec4 dec4(uint u){ return vec4(e4m3(u&255u), e4m3((u>>8)&255u), e4m3((u>>16)&255u), e4m3((u>>24)&255u)); }
+void main() {
+  uint Nn=d.x; uint nb16=d.y/2u; uint bpc=d.z; uint bk=d.w; float inv=uintBitsToFloat(e.x);
+  uint t=gl_GlobalInvocationID.x; uint c=gl_GlobalInvocationID.y;
+  if (t*16u >= Nn) return;
+  vec4 a0=vec4(0.0); vec4 a1=vec4(0.0); vec4 a2=vec4(0.0); vec4 a3=vec4(0.0); uint b0=c*bpc;
+  for (uint bi=0u; bi<bpc; bi++) {
+    uint b=b0+bi; uint su=(b*Nn + t*16u) >> 2u;   // 4 e4m3 per uint -> /4 (was /2 for fp16)
+    vec4 s0=dec4(scalesT[su]);    vec4 s1=dec4(scalesT[su+1u]);
+    vec4 s2=dec4(scalesT[su+2u]); vec4 s3=dec4(scalesT[su+3u]);
+    uint kb=b*bk;
+    for (uint kk=0u; kk<bk; kk++) {
+      uint k=kb+kk; uvec2 p=wpackT[k*nb16+t]; float xv=x[k]; uint lo=p.x; uint hi=p.y;
+      a0 += (vec4(float(lo&15u),float((lo>>4u)&15u),float((lo>>8u)&15u),float((lo>>12u)&15u))-vec4(8.0))*s0*xv;
+      a1 += (vec4(float((lo>>16u)&15u),float((lo>>20u)&15u),float((lo>>24u)&15u),float((lo>>28u)&15u))-vec4(8.0))*s1*xv;
+      a2 += (vec4(float(hi&15u),float((hi>>4u)&15u),float((hi>>8u)&15u),float((hi>>12u)&15u))-vec4(8.0))*s2*xv;
+      a3 += (vec4(float((hi>>16u)&15u),float((hi>>20u)&15u),float((hi>>24u)&15u),float((hi>>28u)&15u))-vec4(8.0))*s3*xv;
+    }
+  }
+  uint o4=(c*Nn + t*16u) >> 2u;   // vec4 index (c*Nn and t*16 are both /4 -> aligned)
+  partial[o4]=a0*inv; partial[o4+1u]=a1*inv; partial[o4+2u]=a2*inv; partial[o4+3u]=a3*inv;
+}
