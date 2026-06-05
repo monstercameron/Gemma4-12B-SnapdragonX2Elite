@@ -54,7 +54,7 @@ class Buf:
         vk.vkBindBufferMemory(dev, self.buf, self.mem, 0); self.size = nbytes
     def write(self, arr):
         a = np.ascontiguousarray(arr); p = vk.vkMapMemory(dev, self.mem, 0, a.nbytes, 0)
-        ffi.memmove(p, a.tobytes(), a.nbytes); vk.vkUnmapMemory(dev, self.mem)
+        ffi.memmove(p, ffi.from_buffer(a), a.nbytes); vk.vkUnmapMemory(dev, self.mem)  # no tobytes() copy
     def read(self, nbytes):
         p = vk.vkMapMemory(dev, self.mem, 0, nbytes, 0); out = bytes(p); vk.vkUnmapMemory(dev, self.mem); return out
 
@@ -136,16 +136,19 @@ model = transformers.Gemma4UnifiedForConditionalGeneration.from_pretrained(
 tm = model.model.language_model; cfg = tm.config
 H = cfg.hidden_size; nH = cfg.num_attention_heads; I = cfg.intermediate_size; V = cfg.vocab_size
 escale = float(getattr(tm.embed_tokens, "scalar_embed_scale", H ** 0.5))
-EMB = tm.embed_tokens.weight.detach().float().cpu().numpy(); softcap = cfg.final_logit_softcapping
+EMB = tm.embed_tokens.weight.detach().float().cpu().numpy(); EMB *= escale  # pre-scale once (in-place, stays f32)
+softcap = cfg.final_logit_softcapping
 print(f"[load] {time.time()-t0:.0f}s; quantizing -> vulkan buffers...", flush=True); t0 = time.time()
 
-def wbuf(a): b = Buf(a.nbytes * 0 + np.asarray(a, np.float32).nbytes); b.write(np.asarray(a, np.float32)); return b
+def wbuf(a): b = Buf(np.asarray(a, np.float32).nbytes); b.write(np.asarray(a, np.float32)); return b
 
 # shared buffers
 def fb(n): return Buf(n * 4)
 B = {k: fb(s) for k, s in {"h": H, "normed": H, "normed2": H, "o": H, "t": H, "t2": H, "down": H,
      "normed_f": H, "qkv": nH * 512 + 2 * 8 * 256, "attn": nH * 512, "gate": I, "up": I, "act": I}.items()}
 B["logits"] = fb(V); B["bp"] = fb(32 * V)   # partial buffer sized for lm_head high-split
+_logits = np.frombuffer(vk.vkMapMemory(dev, B["logits"].mem, 0, V * 4, 0), np.float32, count=V)  # persistent
+_dyn = np.zeros(4, np.uint32)                # reused per-token DYN scratch (no 4-elem alloc per token)
 cosb = {"sliding_attention": fb(256), "full_attention": fb(512)}
 sinb = {"sliding_attention": fb(256), "full_attention": fb(512)}
 DYN = buf_u32([0, 0, 0, 0])
@@ -261,17 +264,17 @@ def set_rope(pos):
         if (pos, lt) not in rope_cache:
             cs, sn = tm.rotary_emb(torch.zeros(1, 1, cfg.head_dim if lt == "sliding_attention" else cfg.global_head_dim),
                                    torch.tensor([[pos]]), layer_type=lt)
-            rope_cache[(pos, lt)] = (cs.reshape(-1).float().numpy().astype(np.float32), sn.reshape(-1).float().numpy().astype(np.float32))
+            rope_cache[(pos, lt)] = (cs.reshape(-1).float().numpy(), sn.reshape(-1).float().numpy())  # .float() is already f32
         cs, sn = rope_cache[(pos, lt)]; cosb[lt].write(cs); sinb[lt].write(sn)
 
 def forward(tid, pos):
-    B["h"].write((EMB[tid] * escale).astype(np.float32))
-    DYN.write(np.array([pos, pos + 1, 0, 0], np.uint32)); set_rope(pos)
+    B["h"].write(EMB[tid])                                  # EMB pre-scaled at load
+    _dyn[0] = pos; _dyn[1] = pos + 1; DYN.write(_dyn); set_rope(pos)
     vk.vkResetFences(dev, 1, [fence])
     vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[cb])], fence)
     vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
     if PROFILE: _read_profile()
-    return np.frombuffer(B["logits"].read(V * 4), np.float32)
+    return _logits                                          # persistent coherent view -- no 1MB copy/token
 
 def _read_profile():
     n = len(_tslab); buf = ffi.new(f"uint64_t[{n}]")
@@ -369,11 +372,11 @@ def set_rope_batch(p0, M):
     for lt in ("sliding_attention", "full_attention"):
         hdl = cfg.head_dim if lt == "sliding_attention" else cfg.global_head_dim
         cs, sn = tm.rotary_emb(torch.zeros(1, M, hdl), posids, layer_type=lt)
-        cosMp[lt].write(cs.reshape(-1).float().numpy().astype(np.float32))
-        sinMp[lt].write(sn.reshape(-1).float().numpy().astype(np.float32))
+        cosMp[lt].write(cs.reshape(-1).float().numpy())   # .float() is already f32
+        sinMp[lt].write(sn.reshape(-1).float().numpy())
 
 def forward_prefill(chunk_ids, p0):
-    Xp.write((EMB[np.array(chunk_ids)] * escale).astype(np.float32).reshape(-1))
+    Xp.write(EMB[np.array(chunk_ids)].reshape(-1))   # EMB is pre-scaled at load
     DYNP.write(np.array([p0, MC, 0, 0], np.uint32)); set_rope_batch(p0, MC)
     for li in range(len(cb_pre_L)):   # grouped submits (TDR-safe); buffers persist between submits
         vk.vkResetFences(dev, 1, [fence])
@@ -404,6 +407,7 @@ def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=()):
     starts at pos=0 so the KV cache (slots 0..pos) is overwritten cleanly -- no cross-request state.
     The fixed command buffer caps total context at MAXT; the prompt is left-truncated to fit."""
     ids = [int(i) for i in ids]
+    if not ids: return   # empty prompt -> nothing to generate (avoids sample(None) crash)
     if len(ids) >= MAXT: ids = ids[-(MAXT - 1):]
     n = len(ids); nfull = (n - 1) // MC if n > MC else 0   # full MC-chunks among tokens 0..n-2
     for c in range(nfull): forward_prefill(ids[c * MC:(c + 1) * MC], c * MC)   # batched prefill
