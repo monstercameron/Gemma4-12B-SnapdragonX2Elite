@@ -583,6 +583,58 @@ Post-fix, same running server:
 
 ---
 
+## Phase 20 — Agent-grade serving: Responses API, sessions, tool calling
+
+The Chat Completions server (Phase 9) was extended toward what real clients/agents need — all text-only,
+all on the same `generate()`:
+
+- **Responses API** (`/v1/responses`): OpenAI's `input`/`output` shape, typed-SSE streaming
+  (`response.created → output_text.delta → completed`), and the spec's stateful path (`store` +
+  `previous_response_id`) via an in-memory conversation store. No native tools/multimodal/structured
+  output (text engine).
+- **Stateful session WebSocket** (`/v1/sessions`): the server keeps the conversation; the client sends
+  only the next message. Multi-turn rides the prefix KV cache. Blocking GPU generation runs in a
+  threadpool with deltas streamed over an asyncio queue so the event loop never blocks.
+- **OpenAI tool / function calling** (`/v1/chat/completions`) — the lever that makes agent clients
+  (opencode) usable. Uses Gemma 4's **native** tool format: the chat template renders
+  `<|tool>declaration…`, the model emits `<|tool_call>call:NAME{gemma-args}<tool_call|>` (tokens 48..49),
+  and the server parses that span back into OpenAI `tool_calls`, converting Gemma's `key:<|"|>val<|"|>`
+  arg syntax to JSON. The round-trip (assistant `tool_calls` + `role:tool` results) renders back through
+  the template. `<tool_call|>`(49) had to be added to the stop set or the model rambled past the call.
+  Validated end-to-end (`get_weather` → result → final answer) and confirmed live: **opencode**
+  (configured `@ai-sdk/openai-compatible`) ran a 6-request tool loop against it.
+- **Reasoning-channel strip**: Gemma 4 emits `<|channel>thought<channel|>` blocks; the label text leaked
+  into `content` until those spans (tokens 100..101) were dropped in both the tool and normal paths.
+
+opencode uses Chat Completions (not Responses or the WebSocket); the real blocker was tool calling, now
+present. Its only remaining cost is model speed on large agent prompts — addressed next.
+
+## Phase 21 — Multi-turn latency, loop escape, and an optional service
+
+- **Prefix cache, take two — the multi-turn fix.** Phase 16's cache had a *2-turn warmup* (it
+  snapshotted only `LCP(current, previous)`, so turn 1 cached nothing and turn 2 paid full cost), and
+  `CACHE_MAX=2048` was too small for agent prompts. Measured: a same-prefix turn-2 was as slow as cold
+  (14.8 s). Fixes: snapshot the **full** MC-aligned prefix every turn (1-turn warmup + a growing
+  conversation cache that re-prefills only each turn's *new* tokens), and raise `CACHE_MAX` to 16384
+  (`GEMMA4_CACHE_MAX`). Result: same-prefix turn-2 **14.8 → 3.1 s**; a 4181-token prompt's turn-2
+  **~57 → 7.2 s (8×)**. For multi-turn/opencode: a cold first turn (~1 min for a big prompt), then
+  ~3–7 s/turn — the 3–5 min → ~1 min fix.
+- **Degeneration guard.** The int4-12B model can fall into a period-≤4 token loop (runaway `\t\t\t…`,
+  repeated `<|image>`/zeros) and spew it to `max_tokens`, wasting tens of seconds for garbage.
+  `generate()` now escapes when a short cycle repeats ≥ `GEMMA4_REPEAT_LIMIT` (32) tokens. Validated: a
+  FizzBuzz-in-assembly prompt that looped stopped at 112 tokens / 9.9 s instead of running to 400;
+  normal prompts unaffected.
+- **`PREFILL_I8` under load** crashed natively (no traceback → OOM / GPU-TDR) after a couple of large
+  agent requests, where the f16 path was stable through every test + opencode's traffic. f16 kept as the
+  default server config; int8 prefill stays an opt-in flag pending a stability fix.
+- **Optional service** (`service/`): a Windows PowerShell lifecycle script (start/stop/restart/status/
+  logs + opt-in Task-Scheduler auto-start *at logon* — chosen over a session-0 service so the Adreno GPU
+  has an interactive session) and a Linux systemd unit. Strictly opt-in; the manual `python src/serve.py`
+  run is unchanged. (Restart re-pays the ~4-min model load — caching quantized buffers to disk is the
+  open follow-up for fast restarts.)
+
+---
+
 ## Final standings
 
 | Path | Correct? | Decode tok/s |
