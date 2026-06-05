@@ -65,7 +65,7 @@ bash vk/build.sh
 # one-shot decode demo
 .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
 
-# OpenAI-compatible server -> http://127.0.0.1:8000/v1
+# OpenAI-compatible server -> http://127.0.0.1:8000/v1  (transparent prefix KV cache; see below)
 .venv-gemma4\Scripts\python.exe src\serve.py --host 127.0.0.1 --port 8000
 
 # GPU per-kernel profile of a decode token graph
@@ -95,6 +95,12 @@ GPU-only) at identical quality (microbench cos 0.99993 vs the f16 path; needle i
 Cost: ~12GB extra weight RAM (int8 stored alongside int4 — decode keeps int4 for its
 bandwidth). Default off; decode is unaffected. Validate the speed/quality yourself with
 `benchmarks\coopgemm_w4a8.py` (no model load).
+
+The server does **transparent prefix KV caching**: it auto-detects the shared leading-token prefix of
+consecutive requests (typically the system prompt), snapshots its KV once, and restores it (a ~ms GPU
+copy) instead of re-prefilling it — so repeated prompts skip the prefix. No API change; warms up after
+two requests. Measured ~26-29% lower latency on a 505-token shared system prompt; longer prefixes
+(RAG contexts) save proportionally more. Validate correctness with `src\test_prefix_cache.py`.
 
 Point any OpenAI client at the server:
 
