@@ -1,5 +1,10 @@
 # gemma4-adreno
 
+![license](https://img.shields.io/badge/license-MIT-blue.svg)
+![platform](https://img.shields.io/badge/platform-Snapdragon%20X2%20%C2%B7%20Adreno%20X2--90-red.svg)
+![python](https://img.shields.io/badge/python-3.12%20ARM64-3776AB.svg)
+![api](https://img.shields.io/badge/API-OpenAI%20compatible-412991.svg)
+
 **Gemma 4 12B running on a Snapdragon X2 Elite's Adreno X2-90 GPU — a from-scratch Vulkan compute engine, no vendor ML runtime.**
 
 Every matmul, attention kernel, RMSNorm, and RoPE is a hand-written GLSL compute shader. The model
