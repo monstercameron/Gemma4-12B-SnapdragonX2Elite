@@ -110,7 +110,7 @@
         <div class="flex justify-between gap-3"><dt class="text-slate-400">SoC</dt><dd class="text-white text-right">Snapdragon X2 Elite Extreme</dd></div>
         <div class="flex justify-between gap-3"><dt class="text-slate-400">GPU</dt><dd class="text-white text-right">Adreno X2-90 (wave 64, coopmat)</dd></div>
         <div class="flex justify-between gap-3"><dt class="text-slate-400">Memory</dt><dd class="text-white text-right">48 GB unified LPDDR5x</dd></div>
-        <div class="flex justify-between gap-3"><dt class="text-slate-400">Bandwidth</dt><dd class="text-white text-right">~123 GB/s achievable</dd></div>
+        <div class="flex justify-between gap-3"><dt class="text-slate-400">Bandwidth</dt><dd class="text-white text-right">~230 GB/s SoC · ~125 GPU</dd></div>
         <div class="flex justify-between gap-3"><dt class="text-slate-400">OS</dt><dd class="text-white text-right">Windows 11 ARM64</dd></div>
       </dl>
     </div>
@@ -177,7 +177,7 @@
           <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:1.5%"></div></div>
         </div>
       </div>
-      <p class="text-xs text-slate-500 mt-5">Decode is memory-bandwidth-bound: ~106 of the ~123 GB/s achievable ceiling, ≈86% of the roof.</p>
+      <p class="text-xs text-slate-500 mt-5">Decode is memory-bandwidth-bound: ~106 of the ~125 GB/s achievable GPU ceiling (≈85% of the roof), itself ~54% of the ~230 GB/s SoC bus.</p>
     </div>
 
     <!-- prefill + optimizations -->
@@ -230,29 +230,31 @@
       </div>
       <div class="mt-6 space-y-4 text-sm">
         <div>
-          <div class="flex justify-between mb-1"><span class="text-slate-400">LPDDR5x theoretical (128-bit)</span><span class="font-mono text-slate-400">~170</span></div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">LPDDR5x theoretical (SoC bus)</span><span class="font-mono text-slate-400">~230</span></div>
           <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim border border-dashed border-white/25" style="width:100%"></div></div>
-          <div class="text-[11px] text-slate-500 mt-1">hard wall — no kernel exceeds it</div>
+          <div class="text-[11px] text-slate-500 mt-1">hard wall — shared across CPU/GPU/NPU; no kernel exceeds it</div>
         </div>
         <div>
-          <div class="flex justify-between mb-1"><span class="text-white font-medium">GPU achievable, int4 streaming</span><span class="font-mono text-white">~123</span></div>
-          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-win" style="width:72%"></div></div>
-          <div class="text-[11px] text-slate-400 mt-1">~72% of theoretical — the realistic ceiling</div>
+          <div class="flex justify-between mb-1"><span class="text-white font-medium">GPU achievable, int4 streaming <span class="text-glow text-[11px] font-normal">measured</span></span><span class="font-mono text-white">~125</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-win" style="width:54%"></div></div>
+          <div class="text-[11px] text-slate-400 mt-1">~54% of the SoC bus — the realistic GPU ceiling (microbench_gemv)</div>
         </div>
         <div>
-          <div class="flex justify-between mb-1"><span class="text-slate-300">generic vec4 read</span><span class="font-mono text-slate-300">~101</span></div>
-          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:59%"></div></div>
+          <div class="flex justify-between mb-1"><span class="text-slate-300">generic vec4 read <span class="text-glow text-[11px]">measured</span></span><span class="font-mono text-slate-300">~106</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:46%"></div></div>
+          <div class="text-[11px] text-slate-500 mt-1">256 MB streaming read (microbench_bw)</div>
         </div>
         <div>
           <div class="flex justify-between mb-1"><span class="text-slate-300">real int4 GEMV (decode)</span><span class="font-mono text-slate-300">~92–106</span></div>
-          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:62%"></div></div>
-          <div class="text-[11px] text-slate-400 mt-1">≈86% of the achievable ceiling — the dominant decode kernel</div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:43%"></div></div>
+          <div class="text-[11px] text-slate-400 mt-1">≈85% of the achievable streaming ceiling — the dominant decode kernel</div>
         </div>
         <div>
           <div class="flex justify-between mb-1"><span class="text-slate-400">system-level useful (6.5 GB ÷ token)</span><span class="font-mono text-slate-400">~70–90</span></div>
-          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:47%"></div></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:35%"></div></div>
         </div>
       </div>
+      <p class="text-xs text-slate-500 mt-5">Measured on-device. The GPU macro reaches only ~half the SoC's LPDDR5x bus — typical for a unified-memory design where the bus is shared.</p>
     </div>
 
     <!-- matrix-core throughput -->
@@ -286,11 +288,12 @@
   <div class="card rounded-2xl p-6 mt-4 flex flex-col sm:flex-row items-center gap-6">
     <div class="shrink-0 text-center sm:text-left">
       <div class="text-4xl font-extrabold text-white font-mono">~73%</div>
-      <div class="text-sm text-slate-400">of the physical wall</div>
+      <div class="text-sm text-slate-400">of the realistic decode ceiling</div>
     </div>
     <div class="text-sm text-slate-300 border-t sm:border-t-0 sm:border-l border-white/10 pt-4 sm:pt-0 sm:pl-6">
-      <span class="font-mono text-white">123 GB/s ÷ ~6.5 GB/token ≈ 19 tok/s</span> is the hard decode ceiling for this model at int4 — no kernel can beat it.
-      The engine delivers <span class="font-mono text-white">13.84</span>, ≈73% of that wall; the remaining gap is the strided-read penalty plus per-token fixed overhead (attention, norms, ~600 barriers), not the GEMV math.
+      Decode reads ~6.5 GB of weights per token, so the ceiling is bandwidth ÷ 6.5. The realistic GPU ceiling is
+      <span class="font-mono text-white">~125 GB/s ÷ 6.5 ≈ 19 tok/s</span>; the SoC's theoretical <span class="font-mono text-white">~230 GB/s ÷ 6.5 ≈ 35 tok/s</span> is a wall no GPU kernel reaches.
+      The engine delivers <span class="font-mono text-white">13.84</span> — ≈73% of the realistic ceiling (≈40% of theoretical). The gap is the strided-read penalty plus per-token fixed overhead (attention, norms, ~600 barriers), not the GEMV math.
     </div>
   </div>
 </section>

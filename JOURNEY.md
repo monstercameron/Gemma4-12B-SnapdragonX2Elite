@@ -179,15 +179,16 @@ ceiling that matters is memory bandwidth, and on this UMA SoC the GPU shares the
 
 | | GB/s | note |
 |---|---|---|
-| SoC theoretical (LPDDR5x, 128‑bit) | **~170** | hard wall — no kernel can exceed it |
-| GPU achievable, int4 load‑only | ~123 | ~72% of theoretical — realistic streaming ceiling |
-| GPU achievable, generic vec4 read | ~101 | measured directly (`microbench_bw.py`) |
-| my real GEMV at the right split | ~92–100 | **~80% of the achievable ceiling** |
-| system‑level useful (6.5 GB ÷ token) | ~70 | the rest is inter‑dispatch overhead |
+| SoC theoretical (LPDDR5x) | **~230** | hard wall — shared across CPU/GPU/NPU; no kernel exceeds it |
+| GPU achievable, int4 streaming | ~125 | **measured** (`microbench_gemv.py` split sweep) — ~54% of the SoC bus; the realistic GPU ceiling |
+| GPU achievable, generic vec4 read | ~106 | measured directly (`microbench_bw.py`, 256 MB) |
+| my real GEMV at the right split | ~92–106 | **~85% of the achievable GPU ceiling** |
+| system‑level useful (6.5 GB ÷ token) | ~70–90 | the rest is inter‑dispatch overhead |
 
-The takeaway that reframed everything: **the individual GEMVs are already ~80% of the achievable
-bandwidth.** `~123 GB/s ÷ 6.5 GB/token ≈ 19 tok/s` is the hard physical ceiling for this model at
-int4; we're at ~11. The gap to ~19 is the strided‑read penalty plus per‑token fixed overhead
+The takeaway that reframed everything: **the individual GEMVs are already ~85% of the achievable GPU
+bandwidth.** `~125 GB/s ÷ 6.5 GB/token ≈ 19 tok/s` is the realistic decode ceiling (the SoC's ~230 GB/s
+÷ 6.5 ≈ 35 tok/s is a wall no GPU kernel reaches — a UMA GPU macro only gets ~half the bus); we're at
+~11→13.84. The gap to ~19 is the strided‑read penalty plus per‑token fixed overhead
 (attention, norms, reduce passes, ~600 barriers) — **not** anything tweakable in the GEMV math.
 
 ### The split heuristic was measured wrong
