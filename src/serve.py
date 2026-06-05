@@ -7,7 +7,7 @@ generation is serialized behind a single lock -- correct for a local single-GPU 
 Run:  .venv-gemma4/Scripts/python.exe src/serve.py [--host H] [--port P]
 Import of vk_engine loads the model + records the command buffer (~minutes) at startup.
 """
-import os, sys, time, json, uuid, threading, argparse, asyncio
+import os, sys, time, json, uuid, threading, argparse, asyncio, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from typing import Optional, Union, List
@@ -40,7 +40,10 @@ app = FastAPI(title="gemma4-litert", description="Gemma 4 12B on Snapdragon X2 A
 # ---------- schemas ----------
 class Msg(BaseModel):
     role: str
-    content: str
+    content: Optional[Union[str, list]] = None
+    tool_calls: Optional[list] = None      # assistant tool calls (round-trip back into the prompt)
+    tool_call_id: Optional[str] = None     # for role="tool" results
+    name: Optional[str] = None
 
 class ChatReq(BaseModel):
     model: str = MODEL_ID
@@ -50,6 +53,8 @@ class ChatReq(BaseModel):
     top_p: float = 1.0
     stream: bool = False
     stop: Optional[Union[str, List[str]]] = None
+    tools: Optional[List[dict]] = None     # OpenAI function tools -> Gemma native tool declarations
+    tool_choice: Optional[Union[str, dict]] = None
 
 class CompReq(BaseModel):
     model: str = MODEL_ID
@@ -80,26 +85,66 @@ _gen_lock = threading.Lock()
 _pref_cache = {"ids": [], "chunks": 0}   # snapshot buffers currently hold this prefix's KV
 _prev_ids: list = []
 
+def _cache_plan(ids):
+    """Decide prefix-cache reuse/snapshot for this prompt vs the previous one. Call under _gen_lock."""
+    global _prev_ids
+    MC = E.MC; CMAX = E.CACHE_MAX // MC
+    nfull = (len(ids) - 1) // MC if len(ids) > MC else 0
+    ck = _pref_cache["chunks"]
+    reuse = ck if (0 < ck <= nfull and ids[:ck * MC] == _pref_cache["ids"]) else 0
+    lcp = 0
+    for a, b in zip(ids, _prev_ids):
+        if a != b: break
+        lcp += 1
+    snap = min(lcp // MC, nfull, CMAX)
+    snap_arg = snap if snap > reuse else 0   # (re)snapshot only when extending past the reused prefix
+    _prev_ids = list(ids)
+    return reuse, snap_arg
+
+def _cache_commit(ids, snap_arg):
+    if snap_arg: _pref_cache.update(ids=ids[:snap_arg * E.MC], chunks=snap_arg)
+
+# ---- tool calling: Gemma emits <|tool_call>(48) call:NAME{gemma-args} <tool_call|>(49). Parse that
+# span and convert Gemma's arg syntax (key:<|"|>val<|"|>) to JSON for OpenAI `tool_calls`. ----
+_TC_OPEN, _TC_CLOSE = 48, 49
+
+def _gemma_args_to_json(argstr):
+    s = argstr.replace('<|"|>', '"')                                  # Gemma string-quote token -> "
+    s = re.sub(r'<\|?[^>]*\|?>', '', s)                               # drop any stray special-token text
+    s = re.sub(r'([{\[,]\s*)([A-Za-z_][\w\-]*)(\s*:)', r'\1"\2"\3', s)  # quote bare keys
+    try: return json.loads(s)
+    except Exception: return {"_raw": argstr.replace('<|"|>', '"')}
+
+def _parse_tool_output(gen_ids):
+    """gen_ids -> (content_text_or_None, [openai tool_call dicts])."""
+    calls, i, first = [], 0, None
+    while i < len(gen_ids):
+        if gen_ids[i] == _TC_OPEN:
+            if first is None: first = i
+            j = i + 1
+            while j < len(gen_ids) and gen_ids[j] != _TC_CLOSE: j += 1
+            span = E.tok.decode(gen_ids[i + 1:j], skip_special_tokens=False).replace('<|"|>', '"')
+            m = re.match(r'\s*call:([A-Za-z_]\w*)\s*(\{.*\})?\s*$', span, re.S)
+            name = m.group(1) if m else span.strip()
+            args = _gemma_args_to_json(m.group(2)) if (m and m.group(2)) else {}
+            calls.append({"id": _uid("call"), "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args)}})
+            i = j + 1
+        else:
+            i += 1
+    seg = gen_ids if first is None else gen_ids[:first]
+    content = (E.tok.decode(seg, skip_special_tokens=True).strip() or None) if seg else None
+    return content, calls
+
 def _run(ids, max_new, temperature, top_p, stop_strs):
     """Yield (delta_text, finish_reason, n_tokens). finish_reason is None until the final yield.
     Decodes the whole running id list each step so sentencepiece spacing is correct; trims at stop
     strings. n_tokens is the real count of tokens the engine produced (for accurate usage)."""
-    global _prev_ids
     with _gen_lock:
-        MC = E.MC; CMAX = E.CACHE_MAX // MC
-        n_ids = len(ids); nfull = (n_ids - 1) // MC if n_ids > MC else 0
-        ck = _pref_cache["chunks"]
-        reuse = ck if (0 < ck <= nfull and ids[:ck * MC] == _pref_cache["ids"]) else 0
-        lcp = 0
-        for a, b in zip(ids, _prev_ids):
-            if a != b: break
-            lcp += 1
-        snap = min(lcp // MC, nfull, CMAX)
-        snap_arg = snap if snap > reuse else 0   # (re)snapshot only when extending past the reused prefix
-        _prev_ids = list(ids)
+        reuse, snap_arg = _cache_plan(ids)
         gen = E.generate(ids, max_new, temperature, top_p, STOP_IDS, reuse_chunks=reuse, snap_chunks=snap_arg)
         _done = object(); first = next(gen, _done)   # runs prefill (incl. snapshot) + first decode token
-        if snap_arg: _pref_cache.update(ids=ids[:snap_arg * MC], chunks=snap_arg)   # snapshot now committed
+        _cache_commit(ids, snap_arg)                  # snapshot now committed
 
         def _toks():
             if first is not _done:
@@ -121,6 +166,31 @@ def _run(ids, max_new, temperature, top_p, stop_strs):
         yield "", ("length" if n >= max_new else "stop"), (n if n >= max_new else n + 1)
 
 
+def _run_tool(ids, max_new, temperature, top_p):
+    """Token-level generation for tool mode. Also stops at <tool_call|> so we halt right after a call
+    (49 is NOT in the model's default stops, so without this it rambles past the call). Yields token ids."""
+    with _gen_lock:
+        reuse, snap_arg = _cache_plan(ids)
+        gen = E.generate(ids, max_new, temperature, top_p, set(STOP_IDS) | {_TC_CLOSE},
+                         reuse_chunks=reuse, snap_chunks=snap_arg)
+        _done = object(); first = next(gen, _done)
+        _cache_commit(ids, snap_arg)
+        if first is not _done:
+            yield first
+            yield from gen
+
+def _msg_dicts(messages):
+    """Msg objects -> chat-template dicts, preserving tool_calls / tool results for the round-trip."""
+    out = []
+    for m in messages:
+        d = {"role": m.role, "content": m.content if m.content is not None else ""}
+        if m.tool_calls: d["tool_calls"] = m.tool_calls
+        if m.tool_call_id: d["tool_call_id"] = m.tool_call_id
+        if m.name: d["name"] = m.name
+        out.append(d)
+    return out
+
+
 # ---------- routes ----------
 @app.get("/health")
 def health(): return {"status": "ok", "model": MODEL_ID}
@@ -133,9 +203,12 @@ def models():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatReq):
-    ids = E.tok.apply_chat_template([m.model_dump() for m in req.messages],
-                                    add_generation_prompt=True, tokenize=True, return_dict=False)
+    kw = {"tools": req.tools} if req.tools else {}   # tools -> Gemma native tool declarations in the prompt
+    ids = E.tok.apply_chat_template(_msg_dicts(req.messages), add_generation_prompt=True,
+                                    tokenize=True, return_dict=False, **kw)
     ids = [int(i) for i in np.array(ids).ravel()]
+    if req.tools:
+        return _complete_tools(req, ids)
     return _complete(req, ids, chat=True)
 
 
@@ -144,6 +217,46 @@ def completions(req: CompReq):
     prompt = req.prompt[0] if isinstance(req.prompt, list) else req.prompt
     ids = [int(i) for i in E.tok(prompt, return_tensors=None)["input_ids"]]
     return _complete(req, ids, chat=False)
+
+
+def _complete_tools(req, ids):
+    """Chat completion with tool calling: stream text until a tool call starts, then emit OpenAI
+    `tool_calls`. Non-stream returns content and/or tool_calls with finish_reason 'tool_calls'."""
+    cid = _uid("chatcmpl"); created = _now(); prompt_n = len(ids)
+    max_new = _fit(prompt_n, req.max_tokens); model = req.model
+    def chunk(delta, fin):
+        return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+
+    if req.stream:
+        def sse():
+            yield f"data: {json.dumps(chunk({'role': 'assistant'}, None))}\n\n"
+            gen_ids, prev, comp_n, toolmode = [], "", 0, False
+            for tid in _run_tool(ids, max_new, req.temperature, req.top_p):
+                gen_ids.append(tid); comp_n = len(gen_ids)
+                if tid == _TC_OPEN: toolmode = True
+                if not toolmode:
+                    text = E.tok.decode(gen_ids, skip_special_tokens=True)
+                    d = text[len(prev):]; prev = text
+                    if d: yield f"data: {json.dumps(chunk({'content': d}, None))}\n\n"
+            _, calls = _parse_tool_output(gen_ids)
+            for idx, tc in enumerate(calls):
+                yield f"data: {json.dumps(chunk({'tool_calls': [{'index': idx, **tc}]}, None))}\n\n"
+            fin = "tool_calls" if calls else ("length" if comp_n >= max_new else "stop")
+            final = chunk({}, fin)
+            final["usage"] = {"prompt_tokens": prompt_n, "completion_tokens": comp_n, "total_tokens": prompt_n + comp_n}
+            yield f"data: {json.dumps(final)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    gen_ids = list(_run_tool(ids, max_new, req.temperature, req.top_p)); comp_n = len(gen_ids)
+    content, calls = _parse_tool_output(gen_ids)
+    fin = "tool_calls" if calls else ("length" if comp_n >= max_new else "stop")
+    msg = {"role": "assistant", "content": content}
+    if calls: msg["tool_calls"] = calls
+    return {"id": cid, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "message": msg, "finish_reason": fin}],
+            "usage": {"prompt_tokens": prompt_n, "completion_tokens": comp_n, "total_tokens": prompt_n + comp_n}}
 
 
 def _complete(req, ids, chat: bool):
