@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 // Flash-decode attention: one workgroup per query head, online softmax tiled over the KV sequence
 // (validated in microbench_flash.py, cos=1.0 to 64k). T = pos+1 for global layers, min(pos+1,window)
 // for sliding (ring buffer). Unbounded context -- no 256-position cap. RoPE for q applied here.
@@ -7,8 +8,8 @@ layout(std430,binding=0) readonly buffer Q{float qkv[];};
 layout(std430,binding=1) readonly buffer QN{float qnw[];};
 layout(std430,binding=2) readonly buffer CO{float cosb[];};
 layout(std430,binding=3) readonly buffer SI{float sinb[];};
-layout(std430,binding=4) readonly buffer KC{float kc[];};
-layout(std430,binding=5) readonly buffer VC{float vc[];};
+layout(std430,binding=4) readonly buffer KC{float16_t kc[];};
+layout(std430,binding=5) readonly buffer VC{float16_t vc[];};
 layout(std430,binding=6) writeonly buffer OB{float outb[];};
 layout(std140,binding=7) uniform Ab{uvec4 a0; uvec4 a1;};   // a0=(nH,nkv,hd,stride) a1=(window,qoff,grp,0)
 layout(std140,binding=8) uniform Dy{uvec4 dy;};             // dy=(pos,...)
@@ -33,7 +34,7 @@ void main(){
   while(tile<T){
     uint tlen=min(256u, T-tile);
     for(uint j=t;j<tlen;j+=256u){ uint kb=(kvh*stride+tile+j)*hd; float d2=0.0;
-      for(uint i=0u;i<hd;i++){ d2+=qr[i]*kc[kb+i]; } sc[j]=d2; }
+      for(uint i=0u;i<hd;i++){ d2+=qr[i]*float(kc[kb+i]); } sc[j]=d2; }
     barrier();
     float mx=-1e30; for(uint j=t;j<tlen;j+=256u){ mx=max(mx,sc[j]); } red[t]=mx; barrier();
     for(uint st=128u;st>0u;st>>=1u){ if(t<st){red[t]=max(red[t],red[t+st]);} barrier(); }
@@ -43,7 +44,7 @@ void main(){
     for(uint st=128u;st>0u;st>>=1u){ if(t<st){red[t]+=red[t+st];} barrier(); }
     if(t==0u){ lsh=lsh*corr+red[0]; } barrier();
     for(uint i=t;i<hd;i+=256u){ float a=acc[i]*corr;
-      for(uint j=0u;j<tlen;j++){ a+=sc[j]*vc[(kvh*stride+tile+j)*hd+i]; } acc[i]=a; }
+      for(uint j=0u;j<tlen;j++){ a+=sc[j]*float(vc[(kvh*stride+tile+j)*hd+i]); } acc[i]=a; }
     barrier();
     tile+=256u;
   }

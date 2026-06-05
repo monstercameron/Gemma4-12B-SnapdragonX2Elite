@@ -1,14 +1,16 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 // Batched KV write for prefill: grid (nkv, M). Each (kvh,m) norms+ropes token m's K and norms its V,
 // storing into the cache at the token's ring/linear slot. Per-position cos/sin (cosM[m]).
+// KV cache is fp16 (half the attention read traffic + 2x context capacity); K~O(1) post-norm/RoPE.
 layout(local_size_x=256) in;
 layout(std430,binding=0) readonly buffer Kb{float kin[];};   // [M,nk] raw k_proj
 layout(std430,binding=1) readonly buffer Vb{float vin[];};   // [M,nk] raw v_proj (bind = Kb if k_eq_v)
 layout(std430,binding=2) readonly buffer KN{float knw[];};   // [hd]
 layout(std430,binding=3) readonly buffer CO{float cosM[];};  // [M,hd]
 layout(std430,binding=4) readonly buffer SI{float sinM[];};
-layout(std430,binding=5) buffer KC{float kc[];};
-layout(std430,binding=6) buffer VC{float vc[];};
+layout(std430,binding=5) buffer KC{float16_t kc[];};
+layout(std430,binding=6) buffer VC{float16_t vc[];};
 layout(std140,binding=7) uniform Pb{uvec4 p0; uvec4 p1;};    // p0=(nkv,hd,nk,0) p1=(stride,window,0,0)
 layout(std140,binding=8) uniform Dy{uvec4 dy;};              // dy=(p0pos,M,0,0)
 shared float hv[512]; shared float sh[256];
@@ -21,10 +23,10 @@ void main(){ uint kvh=gl_WorkGroupID.x; uint m=gl_WorkGroupID.y;
   for(uint st=128u;st>0u;st>>=1u){ if(t<st){sh[t]+=sh[t+st];} barrier(); }
   float ik=inversesqrt(sh[0]/float(hd)+1e-6);
   for(uint i=t;i<hd;i+=256u){ hv[i]=hv[i]*ik*knw[i]; } barrier();
-  for(uint i=t;i<hd;i+=256u){ float rh; if(i<hf){rh=-hv[i+hf];}else{rh=hv[i-hf];} kc[(kvh*stride+slot)*hd+i]=hv[i]*cosM[cb+i]+rh*sinM[cb+i]; }
+  for(uint i=t;i<hd;i+=256u){ float rh; if(i<hf){rh=-hv[i+hf];}else{rh=hv[i-hf];} kc[(kvh*stride+slot)*hd+i]=float16_t(hv[i]*cosM[cb+i]+rh*sinM[cb+i]); }
   barrier();
   for(uint i=t;i<hd;i+=256u){ hv[i]=vin[kb+i]; } barrier();
   s=0.0; for(uint i=t;i<hd;i+=256u){s+=hv[i]*hv[i];} sh[t]=s; barrier();
   for(uint st=128u;st>0u;st>>=1u){ if(t<st){sh[t]+=sh[t+st];} barrier(); }
   float iv=inversesqrt(sh[0]/float(hd)+1e-6);
-  for(uint i=t;i<hd;i+=256u){ vc[(kvh*stride+slot)*hd+i]=hv[i]*iv; } }
+  for(uint i=t;i<hd;i+=256u){ vc[(kvh*stride+slot)*hd+i]=float16_t(hv[i]*iv); } }

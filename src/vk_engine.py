@@ -187,7 +187,7 @@ for li, L in enumerate(tm.layers):
              pfw=wbuf(L.pre_feedforward_layernorm.weight.detach().float().numpy()),
              ofw=wbuf(L.post_feedforward_layernorm.weight.detach().float().numpy()),
              scl=float(L.layer_scalar.item()) if hasattr(L, "layer_scalar") else 1.0,
-             kc=fb(nkv * stride * hd), vc=fb(nkv * stride * hd))
+             kc=Buf(nkv * stride * hd * 2), vc=Buf(nkv * stride * hd * 2))   # fp16 KV cache (half traffic + 2x ctx capacity)
     layers.append(d)
     if (li + 1) % 16 == 0: print(f"  layer {li+1}/48 ({time.time()-t0:.0f}s)", flush=True)
 lmh = i4(model.lm_head); finw = wbuf(tm.norm.weight.detach().float().numpy())
