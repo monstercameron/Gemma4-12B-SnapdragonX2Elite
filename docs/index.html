@@ -43,6 +43,7 @@
     <div class="hidden md:flex items-center gap-7 text-sm text-slate-400">
       <a href="#specs" class="hover:text-white transition">Specs</a>
       <a href="#bench" class="hover:text-white transition">Benchmarks</a>
+      <a href="#roofline" class="hover:text-white transition">Ceilings</a>
       <a href="#journey" class="hover:text-white transition">Journey</a>
       <a href="#features" class="hover:text-white transition">Features</a>
       <a href="#deadends" class="hover:text-white transition">Dead ends</a>
@@ -211,6 +212,85 @@
           <li class="flex justify-between"><span class="text-slate-300">prefix KV cache (repeated prompts)</span><span class="font-mono text-emerald-400">−26–29% latency</span></li>
         </ul>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- roofline / device ceilings -->
+<section id="roofline" class="max-w-6xl mx-auto px-5 pt-24">
+  <h2 class="text-2xl sm:text-3xl font-bold text-white">Device ceilings <span class="text-slate-500 font-normal">— the roofline</span></h2>
+  <p class="text-slate-400 mt-2 max-w-2xl">Every result above is bounded by physics. Here's the hardware's theoretical max vs. what's realistically reachable on this Adreno — and where the engine actually lands.</p>
+
+  <div class="grid lg:grid-cols-2 gap-4 mt-8">
+    <!-- memory bandwidth ladder -->
+    <div class="card rounded-2xl p-6">
+      <div class="flex items-baseline justify-between">
+        <h3 class="text-white font-semibold">Memory bandwidth</h3>
+        <span class="text-xs text-slate-500 font-mono">GB/s · relative to the SoC wall</span>
+      </div>
+      <div class="mt-6 space-y-4 text-sm">
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">LPDDR5x theoretical (128-bit)</span><span class="font-mono text-slate-400">~170</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim border border-dashed border-white/25" style="width:100%"></div></div>
+          <div class="text-[11px] text-slate-500 mt-1">hard wall — no kernel exceeds it</div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-white font-medium">GPU achievable, int4 streaming</span><span class="font-mono text-white">~123</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-win" style="width:72%"></div></div>
+          <div class="text-[11px] text-slate-400 mt-1">~72% of theoretical — the realistic ceiling</div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-300">generic vec4 read</span><span class="font-mono text-slate-300">~101</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:59%"></div></div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-300">real int4 GEMV (decode)</span><span class="font-mono text-slate-300">~92–106</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:62%"></div></div>
+          <div class="text-[11px] text-slate-400 mt-1">≈86% of the achievable ceiling — the dominant decode kernel</div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">system-level useful (6.5 GB ÷ token)</span><span class="font-mono text-slate-400">~70–90</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:47%"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- matrix-core throughput -->
+    <div class="card rounded-2xl p-6">
+      <div class="flex items-baseline justify-between">
+        <h3 class="text-white font-semibold">Matrix-core throughput</h3>
+        <span class="text-xs text-slate-500 font-mono">GFLOP/s · cooperative-matrix</span>
+      </div>
+      <div class="mt-6 space-y-4 text-sm">
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-white font-medium">int8 coopmat · s8×s8→s32</span><span class="font-mono text-white">~10,300</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-win" style="width:100%"></div></div>
+          <div class="text-[11px] text-slate-400 mt-1">64×64×32 tile — powers the W8A8 prefill (2.8× the f16 path)</div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-300">fp16 coopmat · int4 weights</span><span class="font-mono text-slate-300">~3,900</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar" style="width:38%"></div></div>
+          <div class="text-[11px] text-slate-500 mt-1">64×64×16 tile — the default prefill GEMM</div>
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-slate-400">register-tiled int4 GEMM (no coopmat)</span><span class="font-mono text-slate-400">~430</span></div>
+          <div class="h-3 rounded-full bg-white/5"><div class="h-3 rounded-full bar-dim" style="width:4%"></div></div>
+          <div class="text-[11px] text-slate-500 mt-1">the pre-coopmat baseline — ~24× slower than int8 cores</div>
+        </div>
+      </div>
+      <p class="text-xs text-slate-500 mt-5">Decode (M=1 GEMV) can't use the matrix cores — it's bandwidth-bound. Prefill (M=128 GEMM) is compute-bound, so coopmat is the lever there.</p>
+    </div>
+  </div>
+
+  <!-- roofline callout -->
+  <div class="card rounded-2xl p-6 mt-4 flex flex-col sm:flex-row items-center gap-6">
+    <div class="shrink-0 text-center sm:text-left">
+      <div class="text-4xl font-extrabold text-white font-mono">~73%</div>
+      <div class="text-sm text-slate-400">of the physical wall</div>
+    </div>
+    <div class="text-sm text-slate-300 border-t sm:border-t-0 sm:border-l border-white/10 pt-4 sm:pt-0 sm:pl-6">
+      <span class="font-mono text-white">123 GB/s ÷ ~6.5 GB/token ≈ 19 tok/s</span> is the hard decode ceiling for this model at int4 — no kernel can beat it.
+      The engine delivers <span class="font-mono text-white">13.84</span>, ≈73% of that wall; the remaining gap is the strided-read penalty plus per-token fixed overhead (attention, norms, ~600 barriers), not the GEMV math.
     </div>
   </div>
 </section>
