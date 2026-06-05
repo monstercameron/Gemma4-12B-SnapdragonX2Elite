@@ -427,7 +427,11 @@ print(f"[rec] prefill command buffers recorded ({ngrp} groups of <={GLAY} layers
 # ring. Copying CACHE_MAX slots unconditionally is safe: on reuse we resume at the cached length Pa, so
 # slots >= Pa are either overwritten by the resumed prefill or causally masked. Records two command
 # buffers (snapshot kc/vc -> side buffers, and restore) once; submitted on demand. ----------
-CACHE_MAX = 2048                                    # max cached-prefix tokens (MC-aligned, <= CTX)
+# max cached-prefix tokens (MC-aligned, <= CTX). 16384 covers agent prompts (system + tool schemas +
+# conversation) so multi-turn/opencode re-prefills only each turn's new tokens. Global snapshot buffers
+# scale with this (nkv*CACHE_MAX*hd*2 per global layer); 16384 ~= a few hundred MB, copy ~5ms.
+CACHE_MAX = (int(os.environ.get("GEMMA4_CACHE_MAX", "16384")) // 128) * 128
+CACHE_MAX = max(128, min(CACHE_MAX, CTX))
 _snap = []                                          # per-layer (snap_kc, snap_vc, regions)
 for L in layers:
     hd = L["hd"]; nkv = L["nkv"]; win = L["win"]; stride = L["stride"]

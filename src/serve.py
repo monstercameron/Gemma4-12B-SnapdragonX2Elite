@@ -93,19 +93,17 @@ _pref_cache = {"ids": [], "chunks": 0}   # snapshot buffers currently hold this 
 _prev_ids: list = []
 
 def _cache_plan(ids):
-    """Decide prefix-cache reuse/snapshot for this prompt vs the previous one. Call under _gen_lock."""
-    global _prev_ids
+    """Decide prefix-cache reuse/snapshot. Call under _gen_lock.
+    Reuse the cached prefix if this prompt starts with it (exact chunk-aligned length, so the sliding
+    ring stays clean), then (re)snapshot this prompt's FULL MC-aligned prefix -- so the very next
+    request that shares it reuses immediately (1-turn warmup) and a growing conversation keeps extending
+    the cache, re-prefilling only each turn's new tokens."""
     MC = E.MC; CMAX = E.CACHE_MAX // MC
     nfull = (len(ids) - 1) // MC if len(ids) > MC else 0
     ck = _pref_cache["chunks"]
     reuse = ck if (0 < ck <= nfull and ids[:ck * MC] == _pref_cache["ids"]) else 0
-    lcp = 0
-    for a, b in zip(ids, _prev_ids):
-        if a != b: break
-        lcp += 1
-    snap = min(lcp // MC, nfull, CMAX)
-    snap_arg = snap if snap > reuse else 0   # (re)snapshot only when extending past the reused prefix
-    _prev_ids = list(ids)
+    snap = min(nfull, CMAX)
+    snap_arg = snap if snap > reuse else 0    # re-snapshot only when extending past what we reused
     return reuse, snap_arg
 
 def _cache_commit(ids, snap_arg):
