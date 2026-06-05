@@ -7,11 +7,11 @@ generation is serialized behind a single lock -- correct for a local single-GPU 
 Run:  .venv-gemma4/Scripts/python.exe src/serve.py [--host H] [--port P]
 Import of vk_engine loads the model + records the command buffer (~minutes) at startup.
 """
-import os, sys, time, json, uuid, threading, argparse
+import os, sys, time, json, uuid, threading, argparse, asyncio
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from typing import Optional, Union, List
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
@@ -191,6 +191,174 @@ def _complete(req, ids, chat: bool):
         choice = {"index": 0, "text": text, "finish_reason": finish, "logprobs": None}
     return {"id": cid, "object": obj, "created": created, "model": req.model,
             "choices": [choice], "usage": usage}
+
+
+# ======================= Responses API (/v1/responses, OpenAI-spec, text) =======================
+# Maps OpenAI's `input`/`output` shape onto the engine. Supports streaming (typed SSE events) and the
+# spec's stateful path (`store` + `previous_response_id`) via a small in-memory conversation store.
+# Not supported (text-only engine): tool/function calling, multimodal input, structured-output schemas.
+_resp_store: dict = {}   # response_id -> full message list (incl. the assistant reply) for continuation
+
+class RespReq(BaseModel):
+    model: str = MODEL_ID
+    input: Union[str, List[dict]]
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = 16384
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stream: bool = False
+    store: bool = False
+    previous_response_id: Optional[str] = None
+    stop: Optional[Union[str, List[str]]] = None
+
+def _resp_messages(req: RespReq):
+    """Build the chat-template message list from a Responses request (+ prior turns if continuing)."""
+    msgs = list(_resp_store.get(req.previous_response_id, [])) if req.previous_response_id else []
+    if req.instructions and not msgs:
+        msgs.append({"role": "system", "content": req.instructions})
+    items = req.input if isinstance(req.input, list) else [{"role": "user", "content": req.input}]
+    for it in items:
+        if isinstance(it, str):
+            msgs.append({"role": "user", "content": it}); continue
+        if it.get("type", "message") != "message":   # skip tool calls / non-message items (unsupported)
+            continue
+        content = it.get("content", "")
+        text = ("".join(c.get("text", "") for c in content if isinstance(c, dict) and "text" in c)
+                if isinstance(content, list) else str(content))
+        role = it.get("role", "user")
+        msgs.append({"role": role if role in ("user", "assistant", "system") else "user", "content": text})
+    return msgs
+
+def _resp_obj(rid, model, status, output, pn, cn, req, incomplete=None):
+    return {"id": rid, "object": "response", "created_at": _now(), "status": status, "model": model,
+            "output": output, "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
+            "temperature": req.temperature, "top_p": req.top_p, "max_output_tokens": req.max_output_tokens,
+            "instructions": req.instructions, "incomplete_details": incomplete, "error": None, "metadata": {},
+            "usage": {"input_tokens": pn, "output_tokens": cn, "total_tokens": pn + cn}}
+
+def _msg_item(item_id, text, status="completed"):
+    return {"id": item_id, "type": "message", "status": status, "role": "assistant",
+            "content": ([{"type": "output_text", "text": text, "annotations": []}] if text or status == "completed" else [])}
+
+@app.post("/v1/responses")
+def responses(req: RespReq):
+    msgs = _resp_messages(req)
+    ids = [int(x) for x in np.array(E.tok.apply_chat_template(
+        msgs, add_generation_prompt=True, tokenize=True, return_dict=False)).ravel()]
+    max_new = _fit(len(ids), req.max_output_tokens); pn = len(ids)
+    rid = _uid("resp"); item_id = _uid("msg"); stop_strs = _stops(req.stop)
+
+    def _finalize(text, cn, fin):
+        if req.store:
+            _resp_store[rid] = msgs + [{"role": "assistant", "content": text}]
+
+    if req.stream:
+        def sse():
+            seq = [0]
+            def ev(typ, payload):
+                p = {"type": typ, "sequence_number": seq[0], **payload}; seq[0] += 1
+                return f"event: {typ}\ndata: {json.dumps(p)}\n\n"
+            r0 = _resp_obj(rid, req.model, "in_progress", [], pn, 0, req)
+            yield ev("response.created", {"response": r0})
+            yield ev("response.in_progress", {"response": r0})
+            yield ev("response.output_item.added", {"output_index": 0, "item": _msg_item(item_id, "", "in_progress")})
+            yield ev("response.content_part.added", {"item_id": item_id, "output_index": 0, "content_index": 0,
+                     "part": {"type": "output_text", "text": "", "annotations": []}})
+            parts, cn, fin = [], 0, "completed"
+            for delta, f, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs):
+                cn = ntok
+                if delta:
+                    parts.append(delta)
+                    yield ev("response.output_text.delta", {"item_id": item_id, "output_index": 0,
+                             "content_index": 0, "delta": delta})
+                if f is not None: fin = f
+            text = "".join(parts); done = fin == "stop"
+            yield ev("response.output_text.done", {"item_id": item_id, "output_index": 0, "content_index": 0, "text": text})
+            yield ev("response.content_part.done", {"item_id": item_id, "output_index": 0, "content_index": 0,
+                     "part": {"type": "output_text", "text": text, "annotations": []}})
+            yield ev("response.output_item.done", {"output_index": 0, "item": _msg_item(item_id, text)})
+            inc = None if done else {"reason": "max_output_tokens"}
+            final = _resp_obj(rid, req.model, "completed" if done else "incomplete", [_msg_item(item_id, text)], pn, cn, req, inc)
+            _finalize(text, cn, fin)
+            yield ev("response.completed" if done else "response.incomplete", {"response": final})
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    parts, cn, fin = [], 0, "completed"
+    for delta, f, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs):
+        if delta: parts.append(delta)
+        cn = ntok
+        if f is not None: fin = f
+    text = "".join(parts); done = fin == "stop"
+    _finalize(text, cn, fin)
+    inc = None if done else {"reason": "max_output_tokens"}
+    return _resp_obj(rid, req.model, "completed" if done else "incomplete", [_msg_item(item_id, text)], pn, cn, req, inc)
+
+
+# ======================= Session WebSocket (/v1/sessions) =======================
+# A STATEFUL chat session over one connection: the server keeps the conversation, the client sends only
+# the next message. Multi-turn rides the prefix KV cache (each turn re-prefills only the new message).
+# Protocol (JSON per frame):
+#   server->client: {"type":"session.created","session_id":...}
+#   client->server: {"type":"configure","system":?,"temperature":?,"top_p":?,"max_tokens":?,"reset":?}
+#                    {"type":"message","content":"..."}
+#   server->client: {"type":"session.updated","config":{...}}
+#                    {"type":"response.start"} {"type":"response.delta","content":...}
+#                    {"type":"response.done","content":...,"finish_reason":...,"usage":{...}}
+#                    {"type":"error","message":...}
+@app.websocket("/v1/sessions")
+async def sessions(ws: WebSocket):
+    await ws.accept()
+    st = {"system": None, "temperature": 1.0, "top_p": 1.0, "max_tokens": 16384, "history": []}
+    sid = _uid("sess")
+    await ws.send_json({"type": "session.created", "session_id": sid})
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            ev = await ws.receive_json()
+            t = ev.get("type")
+            if t == "configure":
+                for k in ("system", "temperature", "top_p", "max_tokens"):
+                    if k in ev: st[k] = ev[k]
+                if ev.get("reset"): st["history"] = []
+                await ws.send_json({"type": "session.updated",
+                                    "config": {k: st[k] for k in ("system", "temperature", "top_p", "max_tokens")}})
+            elif t == "message":
+                st["history"].append({"role": "user", "content": ev.get("content", "")})
+                msgs = ([{"role": "system", "content": st["system"]}] if st["system"] else []) + st["history"]
+                ids = [int(x) for x in np.array(E.tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=True, return_dict=False)).ravel()]
+                pn = len(ids); max_new = _fit(pn, st["max_tokens"])
+                await ws.send_json({"type": "response.start"})
+                q: asyncio.Queue = asyncio.Queue()
+
+                def worker():
+                    parts, last_n, fin = [], 0, "stop"
+                    try:
+                        for delta, f, ntok in _run(ids, max_new, st["temperature"], st["top_p"], []):
+                            last_n = ntok
+                            if delta: parts.append(delta); loop.call_soon_threadsafe(q.put_nowait, ("delta", delta))
+                            if f is not None: fin = f
+                    finally:
+                        loop.call_soon_threadsafe(q.put_nowait, ("done", "".join(parts), last_n, fin))
+                fut = loop.run_in_executor(None, worker)
+                while True:
+                    m = await q.get()
+                    if m[0] == "delta":
+                        await ws.send_json({"type": "response.delta", "content": m[1]})
+                    else:
+                        _, text, n, fin = m
+                        st["history"].append({"role": "assistant", "content": text})
+                        await ws.send_json({"type": "response.done", "content": text, "finish_reason": fin,
+                                            "usage": {"prompt_tokens": pn, "completion_tokens": n, "total_tokens": pn + n}})
+                        break
+                await fut
+            else:
+                await ws.send_json({"type": "error", "message": f"unsupported event type: {t!r}"})
+    except WebSocketDisconnect:
+        pass
+    except Exception as ex:   # don't kill the worker thread silently; report and close
+        try: await ws.send_json({"type": "error", "message": str(ex)})
+        except Exception: pass
 
 
 if __name__ == "__main__":
