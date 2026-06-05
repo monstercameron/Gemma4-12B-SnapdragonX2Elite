@@ -71,9 +71,18 @@ bash vk/build.sh
 # GPU per-kernel profile of a decode token graph
 $env:PROFILE=1; .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
 
+# opt-in fp8 (e4m3) decode scales: +4.5-8% decode for a ~2%/scale quantization cost
+$env:GEMV_FP8=1; .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
+
 # a microbenchmark
 .venv-gemma4\Scripts\python.exe benchmarks\microbench_gemv.py
 ```
+
+`GEMV_FP8=1` stores the int4 per-block scales as fp8 e4m3 (1 byte vs fp16's 2),
+halving the ~11% of decode bandwidth they cost. Scales are normalized per-tensor
+into e4m3's normal range so quality holds (needle retrieval intact, decoded text
+unchanged); default is fp16 for zero quality risk. Prefill always keeps fp16
+scales — it's compute-bound, so fp8 would not help it.
 
 Point any OpenAI client at the server:
 
