@@ -12,7 +12,11 @@ transformers==5.10.1   # first release with gemma4_unified support
 # --- OpenAI-compatible server ---
 fastapi
 uvicorn[standard]
+websockets        # stateful session WebSocket (/v1/sessions) + the API smoke test
 openai            # only for the client-side compliance test
+
+# --- model download ---
+huggingface_hub   # scripts/download_model.py
 
 # --- optional: the earlier WebGPU engine in experiments/ ---
 # wgpu

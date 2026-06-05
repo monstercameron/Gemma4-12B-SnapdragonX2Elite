@@ -1,0 +1,23 @@
+name: ci
+
+# Runtime tests need the Snapdragon X2 / Adreno GPU + the model weights, so CI is limited to static
+# checks: byte-compile (catches syntax errors) + ruff for real errors (undefined names, etc.).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile (syntax)
+        run: python -m compileall -q src scripts service benchmarks
+      - name: Ruff (errors only)
+        run: |
+          pip install ruff
+          ruff check --select E9,F63,F7,F82,F821 src scripts

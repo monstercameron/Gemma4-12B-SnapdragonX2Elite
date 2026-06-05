@@ -53,17 +53,33 @@ JOURNEY.md      the full development log
 
 ## Setup
 
-Requires **native ARM64 Python 3.12** (the x64-emulated default Python cannot reach the NPU/GPU),
-the **Vulkan SDK** (for `glslangValidator`), and Gemma 4 12B weights placed in `models/gemma-4-12B-it`.
+Requires **native ARM64 Python 3.12** (the x64-emulated default Python cannot reach the NPU/GPU) and,
+to rebuild shaders, the **Vulkan SDK** (`glslangValidator`). The compiled shaders (`vk/*.spv`) are
+committed, so the SDK is optional.
 
 ```powershell
-# native ARM64 python
+# Windows (ARM64): venv + deps + shaders, then download the weights (~24 GB)
+.\scripts\setup.ps1
+.\scripts\setup.ps1 -Model          # or: python scripts\download_model.py
+
+# verify everything (python arch, Vulkan device, shaders, weights)
+.venv-gemma4\Scripts\python.exe scripts\check_env.py
+```
+
+```bash
+# Linux/macOS (needs a working Vulkan driver for your GPU)
+./scripts/setup.sh --model
+```
+
+<details><summary>Manual setup (no scripts)</summary>
+
+```powershell
 python -m venv .venv-gemma4
 .venv-gemma4\Scripts\python.exe -m pip install -r requirements.txt
-
-# compile the shaders (needs the Vulkan SDK on PATH)
-bash vk/build.sh
+bash vk/build.sh                                              # optional (committed .spv used otherwise)
+.venv-gemma4\Scripts\python.exe scripts\download_model.py     # weights -> models\gemma-4-12B-it
 ```
+</details>
 
 ## Usage
 
