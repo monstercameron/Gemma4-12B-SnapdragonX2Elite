@@ -521,6 +521,66 @@ Two decode accelerators evaluated and **correctly declined**, with data not vibe
   Only contrived verbatim echo clears the bar. A draft model would raise acceptance but needs a second
   model. **Not built** — the measurement says it'd be net-negative for real use.
 
+## Phase 18 — Snapdragon X2 prefill tail buckets: measured, then rolled back
+
+After the broader Snapdragon X2 optimization review, I tested a tempting tail optimization: record an
+extra `M=64` coopmat prefill graph so the `0..127` prompt tokens left after full `MC=128` chunks could
+avoid decode-style one-token prefill.
+
+The narrow benchmark looked promising. In one process, with the same model load and greedy `max_new=4`,
+whole 16..64-token tails were byte-identical to the old decode-tail path and faster:
+
+| tail tokens | old decode-tail | 64-bucket tail | speedup | same IDs |
+|---:|---:|---:|---:|---|
+| 16 | 2.96 s | 2.49 s | 1.19× | yes |
+| 32 | 4.84 s | 2.54 s | 1.91× | yes |
+| 64 | 9.27 s | 2.56 s | 3.62× | yes |
+
+The more aggressive variants failed correctness: padding a 96-token tail into the 128-row graph gave a
+large **4.19×** latency win, but changed greedy output IDs; even "first 64 bucketed, rest decode" still
+changed IDs.
+
+Then the default engine showed a decode regression in interactive testing (`vk_engine.py 8` measured
+around **9.6-9.8 tok/s** in that session, below the expected ~13 tok/s class). The runtime tail-bucket
+refactor was rolled back, and the follow-up audit restored `src/vk_engine.py` to a clean no-diff
+baseline. No runtime code from the tail-bucket pass was kept.
+
+The remaining slowdown was system state, not engine code: a detached `src/serve.py` process from the
+venv/native-ARM64 launcher was still resident, and Windows was on the default Balanced power scheme.
+After stopping the stale server and activating a High performance scheme, decode returned above target:
+
+| test state | command | result |
+|---|---|---:|
+| clean runtime, Balanced | `src\vk_engine.py 8` | 8 tok in 0.85 s = **9.459 tok/s** |
+| clean runtime, High performance | `src\vk_engine.py 8` | 8 tok in 0.54 s = **14.746 tok/s** |
+| clean runtime, High performance | `src\vk_engine.py 32` | 32 tok in 2.14 s = **14.977 tok/s** |
+
+## Phase 19 — Server response latency audit
+
+After the engine rollback and power-plan fix, the raw decode benchmark was healthy, but the API server
+still had a bad user-visible latency path. I had only probed `/v1/models` after restart, which missed
+the full chat path. A bounded first chat request reproduced the complaint:
+
+| server state | request | result |
+|---|---|---:|
+| pre-fix, first chat after ready | chat, `max_tokens=8`, 22 prompt tokens | **56.224 s**, 2 completion tokens |
+| pre-fix, second identical chat | chat, `max_tokens=8`, 22 prompt tokens | **1.580 s**, 2 completion tokens |
+
+Fixes in `src/serve.py`:
+
+- Warm the inference path before printing `ready`, so the first user request does not pay cold-path
+  latency.
+- Add per-request timing logs (`prompt`, `max`, `completion`, `finish`, elapsed seconds).
+- Change the default max generation budget from 16k to `GEMMA4_DEFAULT_MAX_TOKENS` (default **512**) so
+  clients that omit `max_tokens` do not accidentally run for minutes.
+
+Post-fix, same running server:
+
+| request | result |
+|---|---:|
+| first chat after ready, `max_tokens=8`, 22 prompt tokens | **1.625 s**, 2 completion tokens |
+| chat with omitted `max_tokens`, 19 prompt tokens | **1.441 s**, 3 completion tokens, max capped at 512 |
+
 ---
 
 ## Final standings

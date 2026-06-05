@@ -18,6 +18,7 @@ import uvicorn
 import vk_engine as E   # heavy: loads weights + records the Vulkan command buffer on import
 
 MODEL_ID = "gemma-4-12b-it"
+DEFAULT_MAX_TOKENS = int(os.environ.get("GEMMA4_DEFAULT_MAX_TOKENS", "512"))
 
 # stop tokens: the model's own generation_config.eos_token_id is authoritative.
 # For this Gemma 4 build that's [1=<eos>, 106=<turn|>, 50] -- the turn delimiter is <turn|>, NOT
@@ -48,7 +49,7 @@ class Msg(BaseModel):
 class ChatReq(BaseModel):
     model: str = MODEL_ID
     messages: List[Msg]
-    max_tokens: Optional[int] = 16384
+    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 1.0
     stream: bool = False
@@ -59,7 +60,7 @@ class ChatReq(BaseModel):
 class CompReq(BaseModel):
     model: str = MODEL_ID
     prompt: Union[str, List[str]]
-    max_tokens: Optional[int] = 16384
+    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 1.0
     stream: bool = False
@@ -75,7 +76,13 @@ def _stops(stop) -> List[str]:
     return [stop] if isinstance(stop, str) else list(stop)
 
 def _fit(prompt_len: int, req_max: Optional[int]) -> int:
-    return max(1, min(req_max or 16384, E.MAXT - prompt_len))
+    return max(1, min(req_max or DEFAULT_MAX_TOKENS, E.MAXT - prompt_len))
+
+def _log_request(kind: str, prompt_n: int, max_new: int, comp_n: int, finish: str, t0: float):
+    dt = max(time.time() - t0, 1e-9)
+    rate = comp_n / dt
+    print(f"[serve] {kind} prompt={prompt_n} max={max_new} completion={comp_n} "
+          f"finish={finish} elapsed={dt:.3f}s out_tok_s={rate:.2f}", flush=True)
 
 # Prefix KV cache: the engine snapshots a shared prompt prefix's KV so repeated prompts skip
 # re-prefilling it. We auto-detect the prefix as the chunk-aligned longest-common-prefix of consecutive
@@ -244,6 +251,7 @@ def _complete_tools(req, ids):
 
     if req.stream:
         def sse():
+            t0 = time.time()
             yield f"data: {json.dumps(chunk({'role': 'assistant'}, None))}\n\n"
             gen_ids, vis, prev, comp_n, toolmode, inch = [], [], "", 0, False, False
             for tid in _run_tool(ids, max_new, req.temperature, req.top_p):
@@ -265,11 +273,14 @@ def _complete_tools(req, ids):
             final["usage"] = {"prompt_tokens": prompt_n, "completion_tokens": comp_n, "total_tokens": prompt_n + comp_n}
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
+            _log_request("chat-tools-stream", prompt_n, max_new, comp_n, fin, t0)
         return StreamingResponse(sse(), media_type="text/event-stream")
 
+    t0 = time.time()
     gen_ids = list(_run_tool(ids, max_new, req.temperature, req.top_p)); comp_n = len(gen_ids)
     content, calls = _parse_tool_output(gen_ids)
     fin = "tool_calls" if calls else ("length" if comp_n >= max_new else "stop")
+    _log_request("chat-tools", prompt_n, max_new, comp_n, fin, t0)
     msg = {"role": "assistant", "content": content}
     if calls: msg["tool_calls"] = calls
     return {"id": cid, "object": "chat.completion", "created": created, "model": model,
@@ -286,8 +297,10 @@ def _complete(req, ids, chat: bool):
 
     if req.stream:
         def sse():
+            t0 = time.time()
             with GPU:
                 comp_n = 0
+                finish = "length"
                 if chat:
                     first = {"id": cid, "object": "chat.completion.chunk", "created": created,
                              "model": req.model, "choices": [{"index": 0,
@@ -295,6 +308,7 @@ def _complete(req, ids, chat: bool):
                     yield f"data: {json.dumps(first)}\n\n"
                 for delta, fin, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs):
                     comp_n = ntok
+                    if fin is not None: finish = fin
                     if chat:
                         ch = {"delta": {"content": delta} if delta else {}, "index": 0, "finish_reason": fin}
                     else:
@@ -306,8 +320,10 @@ def _complete(req, ids, chat: bool):
                                           "total_tokens": prompt_n + comp_n}
                     yield f"data: {json.dumps(chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+                _log_request("chat-stream" if chat else "completion-stream", prompt_n, max_new, comp_n, finish, t0)
         return StreamingResponse(sse(), media_type="text/event-stream")
 
+    t0 = time.time()
     with GPU:
         parts, finish, comp_n = [], "length", 0
         for delta, fin, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs):
@@ -315,6 +331,7 @@ def _complete(req, ids, chat: bool):
             comp_n = ntok
             if fin is not None: finish = fin
         text = "".join(parts)
+    _log_request("chat" if chat else "completion", prompt_n, max_new, comp_n, finish, t0)
     usage = {"prompt_tokens": prompt_n, "completion_tokens": comp_n, "total_tokens": prompt_n + comp_n}
     if chat:
         choice = {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}
@@ -334,7 +351,7 @@ class RespReq(BaseModel):
     model: str = MODEL_ID
     input: Union[str, List[dict]]
     instructions: Optional[str] = None
-    max_output_tokens: Optional[int] = 16384
+    max_output_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 1.0
     stream: bool = False
@@ -439,7 +456,7 @@ def responses(req: RespReq):
 @app.websocket("/v1/sessions")
 async def sessions(ws: WebSocket):
     await ws.accept()
-    st = {"system": None, "temperature": 1.0, "top_p": 1.0, "max_tokens": 16384, "history": []}
+    st = {"system": None, "temperature": 1.0, "top_p": 1.0, "max_tokens": DEFAULT_MAX_TOKENS, "history": []}
     sid = _uid("sess")
     await ws.send_json({"type": "session.created", "session_id": sid})
     loop = asyncio.get_running_loop()
@@ -492,9 +509,24 @@ async def sessions(ws: WebSocket):
         except Exception: pass
 
 
+def _warmup():
+    if os.environ.get("GEMMA4_SKIP_WARMUP") == "1":
+        print("[serve] warmup skipped (GEMMA4_SKIP_WARMUP=1)", flush=True)
+        return
+    prompt = [{"role": "user", "content": "warmup"}]
+    ids = E.tok.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True, return_dict=False)
+    ids = [int(i) for i in np.array(ids).ravel()]
+    t0 = time.time()
+    gen = E.generate(ids, 1, 0.0, 1.0, STOP_IDS, reuse_chunks=0, snap_chunks=0)
+    next(gen, None)
+    print(f"[serve] warmup done prompt={len(ids)} elapsed={time.time()-t0:.3f}s", flush=True)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8000)
     a = ap.parse_args()
-    print(f"[serve] ready on http://{a.host}:{a.port}  (model={MODEL_ID}, stop_ids={sorted(STOP_IDS)})", flush=True)
+    _warmup()
+    print(f"[serve] ready on http://{a.host}:{a.port}  (model={MODEL_ID}, stop_ids={sorted(STOP_IDS)}, "
+          f"default_max_tokens={DEFAULT_MAX_TOKENS})", flush=True)
     uvicorn.run(app, host=a.host, port=a.port, log_level="info")
