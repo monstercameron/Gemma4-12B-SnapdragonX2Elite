@@ -1,0 +1,36 @@
+# Optional systemd unit for the Gemma 4 Vulkan server (generic Linux deployment).
+#
+# NOTE: the reference machine is Windows 11 ARM64 with the Adreno GPU via native Vulkan -- this unit is
+# for a Linux host that has a working Vulkan driver for its GPU. GPU access from a system service can
+# require an active graphics session; prefer a user service (`systemctl --user`) on a logged-in seat.
+#
+# Install (user service, recommended for GPU):
+#   mkdir -p ~/.config/systemd/user
+#   cp service/gemma4.service ~/.config/systemd/user/gemma4.service
+#   # edit WorkingDirectory / ExecStart paths + any Environment= lines below
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now gemma4          # auto-start at login + start now
+#   systemctl --user restart gemma4               # quick restart (model reload ~4 min)
+#   systemctl --user status gemma4 ; journalctl --user -u gemma4 -f
+
+[Unit]
+Description=Gemma 4 12B raw-Vulkan OpenAI-compatible server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gemma4-litert
+ExecStart=%h/gemma4-litert/.venv-gemma4/bin/python src/serve.py --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=600
+# Optional tuning (uncomment as needed):
+# Environment=PREFILL_I8=1
+# Environment=GEMV_FP8=1
+# Environment=GEMMA4_DEFAULT_MAX_TOKENS=1024
+# Environment=GEMMA4_CACHE_MAX=16384
+# Environment=GEMMA4_REPEAT_LIMIT=32
+
+[Install]
+WantedBy=default.target

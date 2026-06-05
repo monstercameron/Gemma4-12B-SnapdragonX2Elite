@@ -74,6 +74,9 @@ bash vk/build.sh
 # OpenAI-compatible server -> http://127.0.0.1:8000/v1  (transparent prefix KV cache; see below)
 .venv-gemma4\Scripts\python.exe src\serve.py --host 127.0.0.1 --port 8000
 
+# optional: run it as a service (one-command start/stop/restart + auto-start) -- see service\README.md
+.\service\gemma4-service.ps1 start   # Windows;  Linux: service\gemma4.service (systemd)
+
 # GPU per-kernel profile of a decode token graph
 $env:PROFILE=1; .venv-gemma4\Scripts\python.exe src\vk_engine.py 8
 
