@@ -1,0 +1,50 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// W4A8 coopmat GEMM: int8 activations x int4 weights. The int4 per-block scale is folded into an
+// on-the-fly int8 RE-quant against a per-COLUMN scale (ratio[b,n] = wscale[b,n]/s_w[n]), so the s32
+// accumulation runs over the FULL K with a single final rescale s_a[m]*s_w[n] -- no per-block rescale
+// (which would need 34KB shared or ~144 regs and blow occupancy on this Adreno). s8xs8->s32, 64x64x32.
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Ab { int8_t  A[]; };      // [M,K] int8 activations
+layout(std430, binding=1) readonly  buffer Wb { uint    wp[]; };     // [K, N/8] packed int4 (engine layout)
+layout(std430, binding=2) readonly  buffer Rb { uint    ratio[]; };  // [nblk, N] fp16 ratio = wscale/s_w
+layout(std430, binding=3) readonly  buffer SAb{ float   sa[]; };     // [M] activation scales (per row)
+layout(std430, binding=4) readonly  buffer SWb{ uint    sw[]; };     // [N] fp16 weight col scales (2/uint)
+layout(std430, binding=5) writeonly buffer Yb { float16_t Y[]; };    // [M,N] output fp16
+layout(std140, binding=6) uniform Ub { uvec4 d; };   // M,N,K,nb8
+shared int8_t  Bsh[32 * 64];
+shared int32_t Csh[64 * 64];
+void main() {
+  uint M = d.x; uint N = d.y; uint K = d.z; uint nb8 = d.w;
+  uint tr = gl_WorkGroupID.y * 64u; uint tc = gl_WorkGroupID.x * 64u; uint t = gl_LocalInvocationID.x;
+  coopmat<int32_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator> acc =
+      coopmat<int32_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator>(0);
+  for (uint k = 0u; k < K; k += 32u) {
+    uint b = k >> 5u;                                   // weight block index (BLK=32 == K-tile)
+    for (uint idx = t; idx < 32u * 64u; idx += 64u) {
+      uint kk = idx >> 6u; uint nn = idx & 63u; uint kr = k + kk; uint nc = tc + nn;
+      uint q = (wp[kr * nb8 + (nc >> 3u)] >> ((nc & 7u) * 4u)) & 15u;
+      uint ri = b * N + nc; vec2 rp = unpackHalf2x16(ratio[ri >> 1u]); float r = ((ri & 1u) == 0u) ? rp.x : rp.y;
+      int v = int(round((float(q) - 8.0) * r));
+      Bsh[kk * 64u + nn] = int8_t(clamp(v, -127, 127));
+    }
+    barrier();
+    coopmat<int8_t, gl_ScopeSubgroup, 64, 32, gl_MatrixUseA> ma;
+    coopmat<int8_t, gl_ScopeSubgroup, 32, 64, gl_MatrixUseB> mb;
+    coopMatLoad(ma, A, tr * K + k, K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, Bsh, 0u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(ma, mb, acc);
+    barrier();
+  }
+  coopMatStore(acc, Csh, 0u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+  barrier();
+  for (uint idx = t; idx < 64u * 64u; idx += 64u) {
+    uint mm = idx >> 6u; uint nn = idx & 63u; uint nc = tc + nn;
+    vec2 sp = unpackHalf2x16(sw[nc >> 1u]); float swv = ((nc & 1u) == 0u) ? sp.x : sp.y;
+    Y[(tr + mm) * N + nc] = float16_t(float(Csh[idx]) * sa[tr + mm] * swv);
+  }
+}

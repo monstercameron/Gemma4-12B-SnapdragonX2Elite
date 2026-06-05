@@ -1,0 +1,37 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// W8A8 coopmat GEMM: int8 activations x PRECOMPUTED int8 weights (per-column scale), s8xs8->s32 over
+// full K, single final rescale s_a[m]*s_w[n]. No on-the-fly requant -> pure int8 matmul speed. Costs 2x
+// weight storage vs int4 (prefill-only; decode keeps int4). Probes the realistic prefill GEMM ceiling.
+layout(local_size_x = 64) in;
+layout(std430, binding=0) readonly  buffer Ab { int8_t  A[]; };    // [M,K] int8 activations
+layout(std430, binding=1) readonly  buffer Wb { int8_t  Wq[]; };   // [K,N] int8 weights (row-major)
+layout(std430, binding=2) readonly  buffer SAb{ float   sa[]; };   // [M] activation scales
+layout(std430, binding=3) readonly  buffer SWb{ uint    sw[]; };   // [N] fp16 weight col scales
+layout(std430, binding=4) writeonly buffer Yb { float16_t Y[]; };  // [M,N] output fp16
+layout(std140, binding=5) uniform Ub { uvec4 d; };   // M,N,K
+shared int32_t Csh[64 * 64];
+void main() {
+  uint M = d.x; uint N = d.y; uint K = d.z;
+  uint tr = gl_WorkGroupID.y * 64u; uint tc = gl_WorkGroupID.x * 64u; uint t = gl_LocalInvocationID.x;
+  coopmat<int32_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator> acc =
+      coopmat<int32_t, gl_ScopeSubgroup, 64, 64, gl_MatrixUseAccumulator>(0);
+  for (uint k = 0u; k < K; k += 32u) {
+    coopmat<int8_t, gl_ScopeSubgroup, 64, 32, gl_MatrixUseA> ma;
+    coopmat<int8_t, gl_ScopeSubgroup, 32, 64, gl_MatrixUseB> mb;
+    coopMatLoad(ma, A, tr * K + k, K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mb, Wq, k * N + tc, N, gl_CooperativeMatrixLayoutRowMajor);
+    acc = coopMatMulAdd(ma, mb, acc);
+  }
+  coopMatStore(acc, Csh, 0u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+  barrier();
+  for (uint idx = t; idx < 64u * 64u; idx += 64u) {
+    uint mm = idx >> 6u; uint nn = idx & 63u; uint nc = tc + nn;
+    vec2 sp = unpackHalf2x16(sw[nc >> 1u]); float swv = ((nc & 1u) == 0u) ? sp.x : sp.y;
+    Y[(tr + mm) * N + nc] = float16_t(float(Csh[idx]) * sa[tr + mm] * swv);
+  }
+}
