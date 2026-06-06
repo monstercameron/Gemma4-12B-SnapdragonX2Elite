@@ -7,7 +7,7 @@ layout(std430,binding=0) readonly buffer Q{float qin[];};   // [M,nq]
 layout(std430,binding=1) readonly buffer QN{float qnw[];};  // [hd]
 layout(std430,binding=2) readonly buffer CO{float cosM[];}; // [M,hd]
 layout(std430,binding=3) readonly buffer SI{float sinM[];};
-layout(std430,binding=4) readonly buffer KC{float16_t kc[];};
+layout(std430,binding=4) readonly buffer KC{f16vec4 kc[];};   // f16vec4: wide K loads (non-coalesced K-dot)
 layout(std430,binding=5) readonly buffer VC{float16_t vc[];};
 layout(std430,binding=6) writeonly buffer OB{float outb[];};// [M,nq]
 layout(std140,binding=7) uniform Ab{uvec4 a0; uvec4 a1;};   // a0=(nH,nq,hd,stride) a1=(window,grp,0,0)
@@ -31,8 +31,9 @@ void main(){
   uint tile=0u;
   while(tile<T){
     uint tlen=min(256u,T-tile);
-    for(uint j=t;j<tlen;j+=256u){ uint slot=tile+j; uint kb=(kvh*stride+slot)*hd; float d2=0.0;
-      for(uint i=0u;i<hd;i++){ d2+=qr[i]*float(kc[kb+i]); }
+    for(uint j=t;j<tlen;j+=256u){ uint slot=tile+j; uint kb4=((kvh*stride+slot)*hd)>>2u; float d2=0.0;
+      for(uint i4=0u;i4<(hd>>2u);i4++){ f16vec4 kv=kc[kb4+i4]; uint i=i4<<2u;
+        d2+=qr[i]*float(kv.x)+qr[i+1u]*float(kv.y)+qr[i+2u]*float(kv.z)+qr[i+3u]*float(kv.w); }
       // sliding ring: a whole chunk's KV is written before attention, so mask keys whose absolute
       // position is in the future of this token (posn>pos). Global layers (window=0) are clipped by T.
       if(window>0u){ uint base=dy.x+dy.y-1u; uint posn=base-((base+window-slot)%window); if(posn>pos){ d2=-1e30; } }

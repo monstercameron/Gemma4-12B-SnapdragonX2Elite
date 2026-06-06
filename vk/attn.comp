@@ -8,7 +8,7 @@ layout(std430,binding=0) readonly buffer Q{float qkv[];};
 layout(std430,binding=1) readonly buffer QN{float qnw[];};
 layout(std430,binding=2) readonly buffer CO{float cosb[];};
 layout(std430,binding=3) readonly buffer SI{float sinb[];};
-layout(std430,binding=4) readonly buffer KC{float16_t kc[];};
+layout(std430,binding=4) readonly buffer KC{f16vec4 kc[];};   // f16vec4: wide K loads (non-coalesced K-dot)
 layout(std430,binding=5) readonly buffer VC{float16_t vc[];};
 layout(std430,binding=6) writeonly buffer OB{float outb[];};
 layout(std140,binding=7) uniform Ab{uvec4 a0; uvec4 a1;};   // a0=(nH,nkv,hd,stride) a1=(window,qoff,grp,0)
@@ -33,8 +33,9 @@ void main(){
   uint tile=0u;
   while(tile<T){
     uint tlen=min(256u, T-tile);
-    for(uint j=t;j<tlen;j+=256u){ uint kb=(kvh*stride+tile+j)*hd; float d2=0.0;
-      for(uint i=0u;i<hd;i++){ d2+=qr[i]*float(kc[kb+i]); } sc[j]=d2; }
+    for(uint j=t;j<tlen;j+=256u){ uint kb4=((kvh*stride+tile+j)*hd)>>2u; float d2=0.0;
+      for(uint i4=0u;i4<(hd>>2u);i4++){ f16vec4 kv=kc[kb4+i4]; uint i=i4<<2u;
+        d2+=qr[i]*float(kv.x)+qr[i+1u]*float(kv.y)+qr[i+2u]*float(kv.z)+qr[i+3u]*float(kv.w); } sc[j]=d2; }
     barrier();
     float mx=-1e30; for(uint j=t;j<tlen;j+=256u){ mx=max(mx,sc[j]); } red[t]=mx; barrier();
     for(uint st=128u;st>0u;st>>=1u){ if(t<st){red[t]=max(red[t],red[t+st]);} barrier(); }
