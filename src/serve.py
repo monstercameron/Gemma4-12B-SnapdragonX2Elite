@@ -19,6 +19,11 @@ import vk_engine as E   # heavy: loads weights + records the Vulkan command buff
 
 MODEL_ID = "gemma-4-12b-it"
 DEFAULT_MAX_TOKENS = int(os.environ.get("GEMMA4_DEFAULT_MAX_TOKENS", "512"))
+# Reasoning channel: the Gemma 4 template defaults enable_thinking=False (model answers immediately).
+# Turning it on lets the model reason before responding -> better tool selection (e.g. realizing `bash`
+# can mkdir), at the cost of extra decode tokens. We strip the <|channel>thought<channel|> from output.
+# GEMMA4_THINK=0 to disable. (To fully revert: delete this line + the enable_thinking= kwargs.)
+THINK = os.environ.get("GEMMA4_THINK", "1") != "0"
 
 # stop tokens: the model's own generation_config.eos_token_id is authoritative.
 # For this Gemma 4 build that's [1=<eos>, 106=<turn|>, 50] -- the turn delimiter is <turn|>, NOT
@@ -286,7 +291,7 @@ def models():
 def chat_completions(req: ChatReq):
     kw = {"tools": req.tools} if req.tools else {}   # tools -> Gemma native tool declarations in the prompt
     ids = E.tok.apply_chat_template(_msg_dicts(req.messages), add_generation_prompt=True,
-                                    tokenize=True, return_dict=False, **kw)
+                                    tokenize=True, return_dict=False, enable_thinking=THINK, **kw)
     ids = [int(i) for i in np.array(ids).ravel()]
     if req.tools:
         return _complete_tools(req, ids)
@@ -452,7 +457,7 @@ def _msg_item(item_id, text, status="completed"):
 def responses(req: RespReq):
     msgs = _resp_messages(req)
     ids = [int(x) for x in np.array(E.tok.apply_chat_template(
-        msgs, add_generation_prompt=True, tokenize=True, return_dict=False)).ravel()]
+        msgs, add_generation_prompt=True, tokenize=True, return_dict=False, enable_thinking=THINK)).ravel()]
     max_new = _fit(len(ids), req.max_output_tokens); pn = len(ids)
     rid = _uid("resp"); item_id = _uid("msg"); stop_strs = _stops(req.stop)
 
@@ -534,7 +539,7 @@ async def sessions(ws: WebSocket):
                 st["history"].append({"role": "user", "content": ev.get("content", "")})
                 msgs = ([{"role": "system", "content": st["system"]}] if st["system"] else []) + st["history"]
                 ids = [int(x) for x in np.array(E.tok.apply_chat_template(
-                    msgs, add_generation_prompt=True, tokenize=True, return_dict=False)).ravel()]
+                    msgs, add_generation_prompt=True, tokenize=True, return_dict=False, enable_thinking=THINK)).ravel()]
                 pn = len(ids); max_new = _fit(pn, st["max_tokens"])
                 await ws.send_json({"type": "response.start"})
                 q: asyncio.Queue = asyncio.Queue()
@@ -574,7 +579,7 @@ def _warmup():
         print("[serve] warmup skipped (GEMMA4_SKIP_WARMUP=1)", flush=True)
         return
     prompt = [{"role": "user", "content": "warmup"}]
-    ids = E.tok.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True, return_dict=False)
+    ids = E.tok.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True, return_dict=False, enable_thinking=THINK)
     ids = [int(i) for i in np.array(ids).ravel()]
     t0 = time.time()
     gen = E.generate(ids, 1, 0.0, 1.0, STOP_IDS, reuse_chunks=0, snap_chunks=0)
