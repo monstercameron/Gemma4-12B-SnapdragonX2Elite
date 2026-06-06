@@ -20,6 +20,15 @@ __pycache__/
 out/
 *.log
 
+# --- diagnostic / scratch test scripts (not part of the shipped engine) ---
+benchmarks/repro_hang.py
+tests/
+test_*.py
+*_test.py
+*_repro.py
+# opencode agent-test scratch (e.g. the hello-world express app it builds)
+projects/
+
 # --- vendor docs (not redistributable) ---
 manuals/
 

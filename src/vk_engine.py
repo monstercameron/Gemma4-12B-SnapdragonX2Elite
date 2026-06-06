@@ -291,6 +291,15 @@ vk.vkEndCommandBuffer(cb)
 print("[rec] command buffer recorded; running inference...", flush=True)
 
 fence = vk.vkCreateFence(dev, vk.VkFenceCreateInfo(), None)
+# Fence wait. Default infinite (0xFFFF...). GEMMA4_FENCE_TIMEOUT_MS>0 enables a finite timeout that
+# raises with the operation label on a GPU wedge -- both a diagnostic (pinpoint which submit hangs)
+# and the basis for resilience (turn a permanent freeze into a recoverable error).
+_FENCE_MS = int(os.environ.get("GEMMA4_FENCE_TIMEOUT_MS", "0"))
+_FENCE_NS = _FENCE_MS * 1_000_000 if _FENCE_MS > 0 else 0xFFFFFFFFFFFFFFFF
+def _wait_fence(label=""):
+    r = vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, _FENCE_NS)
+    if r == vk.VK_TIMEOUT:
+        raise RuntimeError(f"GPU fence TIMEOUT after {_FENCE_MS}ms at [{label}]")
 rope_cache = {}
 def set_rope(pos):
     for lt in ("sliding_attention", "full_attention"):
@@ -305,7 +314,7 @@ def forward(tid, pos):
     _dyn[0] = pos; _dyn[1] = pos + 1; DYN.write(_dyn); set_rope(pos)
     vk.vkResetFences(dev, 1, [fence])
     vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[cb])], fence)
-    vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+    _wait_fence(f"decode pos={pos}")
     if PROFILE: _read_profile()
     return _logits                                          # persistent coherent view -- no 1MB copy/token
 
@@ -460,7 +469,7 @@ _cb_snap = _rec_copy(False); _cb_restore = _rec_copy(True)
 def _kv_copy(C):   # submit a pre-recorded copy command buffer and wait
     vk.vkResetFences(dev, 1, [fence])
     vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[C])], fence)
-    vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+    _wait_fence("kv_copy")
 
 def set_rope_batch(p0, M):
     posids = torch.arange(p0, p0 + M).reshape(1, M)
@@ -476,7 +485,7 @@ def forward_prefill(chunk_ids, p0):
     for li in range(len(cb_pre_L)):   # grouped submits (TDR-safe); buffers persist between submits
         vk.vkResetFences(dev, 1, [fence])
         vk.vkQueueSubmit(queue, 1, [vk.VkSubmitInfo(pCommandBuffers=[cb_pre_L[li]])], fence)
-        vk.vkWaitForFences(dev, 1, [fence], vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+        _wait_fence(f"prefill p0={p0} layer={li}")
         if PREPROF: _read_preprofile(layers[li])
 
 def _read_preprofile(L):

@@ -707,6 +707,60 @@ DirectX would be a rewrite for a regression.
 
 ---
 
+## Phase 24 — Driving a real agent (opencode): tool calling, loops, and GPU-wedge resilience
+
+Pointing **opencode** at the server exposed a stack of agent-integration failures the single-shot
+benchmarks never hit. Each was diagnosed from evidence — a new `GEMMA4_DEBUG=1` log (`out/debug.jsonl`:
+the **raw generation *with* special tokens**, thinking/visible split, parsed tool calls) and, when the
+server didn't even log the bad turns, opencode's own SQLite store (`~/.local/share/opencode/opencode.db`,
+tables `message`/`part`, read `mode=ro` to apply the WAL).
+
+**Findings & fixes (all flag-gated / removable):**
+- **Thinking sabotages agentic tool use.** With reasoning on, the model (a) *reasoned itself into refusals*
+  ("I do not have the capability to create folders" — 615 thinking tokens, then no tool call), and (b) held
+  the single GPU lock for minutes of silent reasoning → head-of-line-blocked every queued request. Default
+  `GEMMA4_THINK=0` for agent serving.
+- **Tool calls need near-greedy.** At `temperature=1.0` (opencode's default) the model samples *away* from
+  the native `<|tool_call>` DSL into a **markdown code block** → empty `tool_calls`. Clamp tool requests to
+  greedy (`GEMMA4_TOOL_TEMP=0`). 3/3 → reliable `bash({"command":...})`.
+- **Tool-arg parser hardened.** On complex content (a `write` of JS full of backticks/quotes/colons) the
+  model *malforms* the DSL — closes the `content` string with a stray backtick instead of `<|"|>`, wraps
+  `filePath` in `'...'`. The old parser dropped `filePath` → opencode "SchemaError(Missing filePath)" → the
+  greedy model **retried the identical call 12+ times** (an infinite loop). Parser now accepts `<|"|>`/`'`/`"`
+  delimiters and recovers a trailing `,key:value` from an unterminated string.
+- **Plan-narration loop.** On a compound step the model described a plan ("I'll create package.json, run
+  `npm init`…") and stopped — and being greedy, re-emitted the *same* narration every turn. Fixed with
+  `AGENTS.md` steering: act-with-tools-don't-narrate, never-repeat, you're-not-read-only, **non-interactive
+  PowerShell** (`Invoke-WebRequest -UseBasicParsing`, not bare `curl`), and run-it-yourself.
+- **bash-vs-PowerShell coercion.** opencode declares its shell tool as `bash` with a bash description even
+  on Windows. The server rewrites the *description* (keeping the name, so the call still round-trips) to force
+  PowerShell — verified: "delete the build folder and list files" → `Remove-Item -Recurse -Force; Get-ChildItem`,
+  not `rm -rf && ls` (`GEMMA4_COERCE_PS`).
+- **Output cap.** opencode sends `max_tokens=32000`; one "generate the whole CRUD app" turn can stream
+  thousands of tokens at ~5 tok/s — minutes of held GPU lock. Cap to 4096 (`GEMMA4_MAX_OUTPUT`).
+
+**The hard one — GPU wedge.** Large multi-turn tool sessions (~10K-token context, building a CRUD app)
+intermittently **wedged the Adreno GPU mid-generation**: CPU went idle, and because every fence wait used
+an *infinite* timeout, the CPU blocked forever holding `_gen_lock` → the whole server froze, needing a manual
+restart. A controlled repro (`benchmarks/repro_hang.py`) **could not reproduce it**: large prompt + full
+1000-token decode to pos 11200 *and* the prefix-cache snapshot/reuse path both ran clean at steady ~111 ms/tok.
+So the wedge is **not** a deterministic function of context length, long decode, or the KV-copy path — it's
+sporadic/cumulative (a rare driver fault under sustained real load) or a not-yet-isolated multi-turn edge case.
+
+**Resilience shipped (the practical fix):** `GEMMA4_FENCE_TIMEOUT_MS` (engine; server sets 60s) makes the
+fence wait **raise with the operation label** (`decode pos=N` / `prefill p0=N layer=L` / `kv_copy`) on a wedge
+instead of freezing. The server catches it, latches `_GPU_WEDGED` → the in-flight request fails cleanly (lock
+auto-releases), later requests get an immediate **503**, and `/health` reports `gpu_wedged`. A wedged Vulkan
+device can't be reset in-process, so recovery still = restart — but the silent 10-minute freeze is gone, and
+the label will capture the *real* wedging op the next time it happens live.
+
+**Verdict:** the engine now drives opencode end-to-end (builds, edits, runs, and tests an Express server) once
+thinking is off, tool temp is greedy, the arg parser tolerates malformed DSL, and `AGENTS.md` + PowerShell
+coercion steer behavior. The GPU wedge under heavy sustained load remains an open root-cause item — made
+non-fatal by the resilience layer, with diagnostics in place to catch it.
+
+---
+
 ## Final standings
 
 | Path | Correct? | Decode tok/s |
