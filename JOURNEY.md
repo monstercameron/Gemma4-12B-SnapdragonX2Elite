@@ -634,6 +634,44 @@ present. Its only remaining cost is model speed on large agent prompts — addre
   run is unchanged. (Restart re-pays the ~4-min model load — caching quantized buffers to disk is the
   open follow-up for fast restarts.)
 
+## Phase 22 — int4-preserving optimization sweep (benchmark-gated, keep-only-if-better)
+
+Surveyed what other inference frameworks add (vLLM, SGLang, TRT-LLM, llama.cpp), filtered to
+**single-user + stays-at-int4**, then ran each candidate through a modular loop: establish a baseline,
+apply one change, re-measure, **keep only if faster, revert if not**. A reproducible GPU-direct
+benchmark (`benchmarks/bench_engine.py`) measures decode tok/s at short/mid/long context (KV-read share
+grows with context) + prefill rate.
+
+**Baseline (int4):** decode 14.7 / 12.1 / 10.9 tok/s @ctx 16 / 1024 / 4096; prefill 55.4 prompt-tok/s.
+The 14.7→10.9 decode drop with context is the long-context attention cost — the regime KV-side
+optimizations target.
+
+- **Wide `f16vec4` K-loads — shipped, the win.** The attention K-dot streams each key's row
+  *per-thread* (adjacent threads read different keys → non-coalesced), so it was bandwidth-starved on
+  scalar fp16 loads — the same shape as the GEMV the `uvec2` trick fixed (Phase 8). Loading K as
+  `f16vec4` (4 fp16/transaction) in `attn.comp` + `pre_attn.comp`: **prefill 55.4 → 62.3 prompt-tok/s
+  (+12.5%)**, decode @ctx1024 +4.5%, needle retrieved / logits finite. Same fp16 data, identical math,
+  **zero quality risk, no engine change**. The V-accumulate was left scalar — it's already coalesced
+  across threads (per key), so wide loads wouldn't help it.
+- **Richer samplers — shipped (perf-neutral).** `top_k` / `min_p` / `repetition_penalty` added to
+  `sample()` (penalty applies to greedy too) + the OpenAI fields on the server. CPU-side, off the
+  `forward()` hot path → benchmark unchanged; `repetition_penalty` also pre-empts the loops the Phase-21
+  degeneration guard otherwise hard-escapes.
+
+**Assessed and *not* pursued** (the discipline argues against heavy/marginal changes):
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| **int8 KV quant** | skip | wide-K already took the cheap K-read win; int8's remaining byte-halving is ~3–5% at long ctx (near thermal noise) for a heavy, bug-prone build (4 shaders + 2 new descriptor layouts + per-slot scale buffers + extend the prefix-cache snapshot to 4 buffers + quality risk) |
+| **speculative / lookahead decode** | skip (for now) | the only lever that could give a *big* decode win, but needs a cheap small-M (M≈8) batched-GEMV forward the engine lacks (coopmat pads M<64 → too costly; M=1 GEMV reads weights per token). Major new kernel; verify-cost economics (Phase 17) make payoff uncertain |
+| **grammar-constrained decoding** | defer | reliability (valid-JSON tool args), not decode speed — substantial grammar+logit-mask build |
+| **multi-entry / radix prefix cache** | defer | helps a multi-prefix workload, not single-stream decode |
+| **AWQ / sub-4-bit** | out of scope | AWQ is quality-at-int4 (no speed); sub-4-bit changes the bitrate (not int4-preserving) |
+
+**Takeaway:** at int4, single-user, decode is at the bandwidth wall — the only *free* win left was the
+attention K-load coalescing fix (which also lifted prefill). Everything else is either marginal,
+non-speed, or needs a major kernel; the benchmark-gated loop kept exactly the change that earned it.
+
 ---
 
 ## Final standings

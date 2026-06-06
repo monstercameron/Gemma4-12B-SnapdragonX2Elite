@@ -29,7 +29,9 @@ custom wgpu 7.07 · llama.cpp Vulkan 6.06 · the ONNX/QNN starting point 0.024.
 - **int4 GEMV tuned to the Adreno** — `uvec2` (64-bit) coalesced weight loads + adaptive K-split for
   occupancy + a record-once Vulkan command buffer (one submit per token, no per-token re-encode).
 - **64k context** via flash-decode attention (online softmax, unbounded T) and a sliding-window ring
-  buffer for the local-attention layers — fits in 48 GB unified memory.
+  buffer for the local-attention layers — fits in 48 GB unified memory. The attention K-dot uses **wide
+  `f16vec4` KV loads** (the K read is non-coalesced per-thread, so wider transactions matter) — **+12.5%
+  prefill, +4.5% long-context decode** at zero quality cost.
 - **Batched prefill on the matrix cores** — `VK_KHR_cooperative_matrix` GEMM with an in-kernel int4
   dequant; ~4.7× faster than per-token prefill on the fp16 path, **~2× more again with `PREFILL_I8=1`**
   (the Adreno's int8 coopmat is 3.7× the f16 path; W8A8 with the per-block scale folded into precomputed
@@ -51,7 +53,7 @@ src/            the engine + server
   test_longctx.py long-context needle-in-haystack test
   test_prefix_cache.py  prefix-cache correctness test (reuse == cold, byte-identical)
 vk/             GLSL compute shaders (.comp) + compiled SPIR-V (.spv) + build.sh
-benchmarks/     standalone microbenchmarks (kernel decomposition, coopmat, bandwidth, ...)
+benchmarks/     standalone microbenchmarks (kernel decomposition, coopmat, bandwidth, ...) + bench_engine.py (decode@ctx / prefill harness)
 experiments/    research path: the earlier ONNX/QNN shard pipeline + the WebGPU (wgpu) engine
 JOURNEY.md      the full development log
 ```
@@ -137,7 +139,7 @@ two requests. Measured ~26-29% lower latency on a 505-token shared system prompt
 
 | Endpoint | What |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming, `usage`, **tool/function calling** via Gemma's native tool format — works with agent clients like opencode) |
+| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + non-streaming, `usage`, **tool/function calling** via Gemma's native tool format — works with agent clients like opencode; samplers: `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`) |
 | `POST /v1/completions` | OpenAI legacy completions |
 | `POST /v1/responses` | OpenAI **Responses API** (text) — `input`/`output` shape, typed SSE streaming, and the spec's stateful path (`store` + `previous_response_id`). No native tools/multimodal (text-only engine) |
 | `WS /v1/sessions` | **Stateful session** over one WebSocket — server keeps the conversation, client sends only the next message; multi-turn rides the prefix KV cache. `configure` / `message` → `response.delta` / `response.done` |
