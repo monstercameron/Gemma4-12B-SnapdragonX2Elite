@@ -498,19 +498,30 @@ from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(MODEL)
 
 
-def sample(logits, temperature=0.0, top_p=1.0):
-    """CPU-side next-token pick. Greedy when temperature<=0 (softcap is monotonic -> argmax invariant,
-    so we skip it). Otherwise apply final-logit softcapping, temperature, nucleus top-p, then sample."""
+def sample(logits, temperature=0.0, top_p=1.0, top_k=0, min_p=0.0, rep_penalty=1.0, recent=None):
+    """CPU-side next-token pick. Greedy when temperature<=0 (softcap is monotonic -> argmax invariant).
+    repetition_penalty divides positive / multiplies negative logits of recently-seen tokens (applies
+    even to greedy). Then softcap+temperature, and the top_k / min_p / top_p truncations before sampling."""
+    if rep_penalty != 1.0 and recent:
+        logits = logits.copy()
+        idx = np.fromiter(set(int(r) for r in recent), dtype=np.int64)
+        lv = logits[idx]
+        logits[idx] = np.where(lv > 0, lv / rep_penalty, lv * rep_penalty)
     if temperature <= 0.0:
         return int(np.argmax(logits))
     z = (softcap * np.tanh(logits.astype(np.float64) / softcap)) / max(temperature, 1e-6)
     z -= z.max(); p = np.exp(z); p /= p.sum()
-    if 0.0 < top_p < 1.0:
+    if top_k and 0 < top_k < p.shape[0]:                      # keep top-k
+        kth = np.partition(p, -top_k)[-top_k]; p = np.where(p >= kth, p, 0.0)
+    if 0.0 < min_p < 1.0:                                     # keep prob >= min_p * max
+        p = np.where(p >= min_p * p.max(), p, 0.0)
+    if 0.0 < top_p < 1.0:                                     # nucleus
         order = np.argsort(p)[::-1]; cum = np.cumsum(p[order])
         cut = int(np.searchsorted(cum, top_p)) + 1
-        mask = np.zeros_like(p); keep = order[:cut]; mask[keep] = p[keep]
-        p = mask / mask.sum()
-    return int(np.random.choice(p.shape[0], p=p))
+        mask = np.zeros_like(p); keep = order[:cut]; mask[keep] = p[keep]; p = mask
+    s = p.sum()
+    if s <= 0: return int(np.argmax(logits))
+    return int(np.random.choice(p.shape[0], p=p / s))
 
 
 def _loop_tail(buf, limit):
@@ -525,7 +536,8 @@ def _loop_tail(buf, limit):
             return True
     return False
 
-def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_chunks=0, snap_chunks=0):
+def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_chunks=0, snap_chunks=0,
+             top_k=0, min_p=0.0, rep_penalty=1.0):
     """Prefill `ids` then yield generated token ids one at a time (greedy or sampled).
     Prefix KV cache: `reuse_chunks` skips the first N prefill chunks (their KV is restored from the
     snapshot); `snap_chunks` snapshots the first N chunks' KV after prefilling them (for later reuse).
@@ -541,15 +553,15 @@ def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_ch
         if c + 1 == snap_chunks: _kv_copy(_cb_snap)            # snapshot the shared-prefix KV
     logits = None
     for pos in range(nfull * MC, n): logits = forward(ids[pos], pos)           # tail + last via decode
-    pos = n; recent = []
+    pos = n; recent = []; REPW = max(REPEAT_LIMIT + 8, 64)   # window for loop-guard + repetition penalty
     for _ in range(max_new):
-        nxt = sample(logits, temperature, top_p)
+        nxt = sample(logits, temperature, top_p, top_k, min_p, rep_penalty,
+                     recent if rep_penalty != 1.0 else None)
         if nxt in stop_ids: return
         yield nxt
-        if REPEAT_LIMIT:                                    # escape degenerate token loops
-            recent.append(nxt)
-            if len(recent) > REPEAT_LIMIT + 8: recent = recent[-(REPEAT_LIMIT + 8):]
-            if _loop_tail(recent, REPEAT_LIMIT): return
+        recent.append(nxt)
+        if len(recent) > REPW: recent = recent[-REPW:]
+        if REPEAT_LIMIT and _loop_tail(recent, REPEAT_LIMIT): return   # escape degenerate token loops
         if pos >= MAXT - 1: return
         logits = forward(nxt, pos); pos += 1
 

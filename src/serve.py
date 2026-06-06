@@ -52,6 +52,9 @@ class ChatReq(BaseModel):
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     temperature: float = 1.0
     top_p: float = 1.0
+    top_k: int = 0                         # 0 = off
+    min_p: float = 0.0                     # 0 = off
+    repetition_penalty: float = 1.0        # 1.0 = off
     stream: bool = False
     stop: Optional[Union[str, List[str]]] = None
     tools: Optional[List[dict]] = None     # OpenAI function tools -> Gemma native tool declarations
@@ -151,13 +154,14 @@ def _parse_tool_output(gen_ids):
     content = (E.tok.decode(seg, skip_special_tokens=True).strip() or None) if seg else None
     return content, calls
 
-def _run(ids, max_new, temperature, top_p, stop_strs):
+def _run(ids, max_new, temperature, top_p, stop_strs, top_k=0, min_p=0.0, rep_penalty=1.0):
     """Yield (delta_text, finish_reason, n_tokens). finish_reason is None until the final yield.
     Decodes the whole running id list each step so sentencepiece spacing is correct; trims at stop
     strings. n_tokens is the real count of tokens the engine produced (for accurate usage)."""
     with _gen_lock:
         reuse, snap_arg = _cache_plan(ids)
-        gen = E.generate(ids, max_new, temperature, top_p, STOP_IDS, reuse_chunks=reuse, snap_chunks=snap_arg)
+        gen = E.generate(ids, max_new, temperature, top_p, STOP_IDS, reuse_chunks=reuse, snap_chunks=snap_arg,
+                         top_k=top_k, min_p=min_p, rep_penalty=rep_penalty)
         _done = object(); first = next(gen, _done)   # runs prefill (incl. snapshot) + first decode token
         _cache_commit(ids, snap_arg)                  # snapshot now committed
 
@@ -185,13 +189,14 @@ def _run(ids, max_new, temperature, top_p, stop_strs):
         yield "", ("length" if n >= max_new else "stop"), (n if n >= max_new else n + 1)
 
 
-def _run_tool(ids, max_new, temperature, top_p):
+def _run_tool(ids, max_new, temperature, top_p, top_k=0, min_p=0.0, rep_penalty=1.0):
     """Token-level generation for tool mode. Also stops at <tool_call|> so we halt right after a call
     (49 is NOT in the model's default stops, so without this it rambles past the call). Yields token ids."""
     with _gen_lock:
         reuse, snap_arg = _cache_plan(ids)
         gen = E.generate(ids, max_new, temperature, top_p, set(STOP_IDS) | {_TC_CLOSE},
-                         reuse_chunks=reuse, snap_chunks=snap_arg)
+                         reuse_chunks=reuse, snap_chunks=snap_arg,
+                         top_k=top_k, min_p=min_p, rep_penalty=rep_penalty)
         _done = object(); first = next(gen, _done)
         _cache_commit(ids, snap_arg)
         if first is not _done:
@@ -252,7 +257,7 @@ def _complete_tools(req, ids):
             t0 = time.time()
             yield f"data: {json.dumps(chunk({'role': 'assistant'}, None))}\n\n"
             gen_ids, vis, prev, comp_n, toolmode, inch = [], [], "", 0, False, False
-            for tid in _run_tool(ids, max_new, req.temperature, req.top_p):
+            for tid in _run_tool(ids, max_new, req.temperature, req.top_p, req.top_k, req.min_p, req.repetition_penalty):
                 gen_ids.append(tid); comp_n = len(gen_ids)
                 if tid == _TC_OPEN: toolmode = True
                 if not toolmode:
@@ -275,7 +280,7 @@ def _complete_tools(req, ids):
         return StreamingResponse(sse(), media_type="text/event-stream")
 
     t0 = time.time()
-    gen_ids = list(_run_tool(ids, max_new, req.temperature, req.top_p)); comp_n = len(gen_ids)
+    gen_ids = list(_run_tool(ids, max_new, req.temperature, req.top_p, req.top_k, req.min_p, req.repetition_penalty)); comp_n = len(gen_ids)
     content, calls = _parse_tool_output(gen_ids)
     fin = "tool_calls" if calls else ("length" if comp_n >= max_new else "stop")
     _log_request("chat-tools", prompt_n, max_new, comp_n, fin, t0)
@@ -304,7 +309,7 @@ def _complete(req, ids, chat: bool):
                              "model": req.model, "choices": [{"index": 0,
                              "delta": {"role": "assistant"}, "finish_reason": None}]}
                     yield f"data: {json.dumps(first)}\n\n"
-                for delta, fin, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs):
+                for delta, fin, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs, req.top_k, req.min_p, req.repetition_penalty):
                     comp_n = ntok
                     if fin is not None: finish = fin
                     if chat:
@@ -324,7 +329,7 @@ def _complete(req, ids, chat: bool):
     t0 = time.time()
     with GPU:
         parts, finish, comp_n = [], "length", 0
-        for delta, fin, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs):
+        for delta, fin, ntok in _run(ids, max_new, req.temperature, req.top_p, stop_strs, req.top_k, req.min_p, req.repetition_penalty):
             if delta: parts.append(delta)
             comp_n = ntok
             if fin is not None: finish = fin
