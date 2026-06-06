@@ -7,7 +7,7 @@ generation is serialized behind a single lock -- correct for a local single-GPU 
 Run:  .venv-gemma4/Scripts/python.exe src/serve.py [--host H] [--port P]
 Import of vk_engine loads the model + records the command buffer (~minutes) at startup.
 """
-import os, sys, time, json, uuid, threading, argparse, asyncio, re
+import os, sys, time, json, uuid, threading, argparse, asyncio, re, platform
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from typing import Optional, Union, List
@@ -126,12 +126,54 @@ def _visible_ids(ids):
         elif not inch: out.append(t)
     return out
 
+_QUOTE = '<|"|>'   # Gemma's string-delimiter token in tool-call args
+
+# Per-OS filesystem handling: tools run on THIS host, so normalize path separators in path-like tool
+# args to the host OS -- the model's slash direction (often Unix `/` even on Windows) then doesn't matter.
+# Only path-keys are touched; bash `command`, glob/grep `pattern`, and `url` keep their slashes.
+_HOST_OS = platform.system()          # 'Windows' | 'Linux' | 'Darwin'
+_HOST_SEP, _FOREIGN_SEP = ("\\", "/") if _HOST_OS == "Windows" else ("/", "\\")
+_PATH_KEYS = {"filepath", "path", "file", "filename", "dir", "directory", "folder",
+              "cwd", "workdir", "source", "destination", "target", "output", "input"}
+
+def _normalize_paths(args):
+    if not isinstance(args, dict) or "_raw" in args:
+        return args
+    for k, v in list(args.items()):
+        if isinstance(v, str) and v and k.lower() in _PATH_KEYS and (_FOREIGN_SEP in v):
+            args[k] = v.replace(_FOREIGN_SEP, _HOST_SEP)
+    return args
+
 def _gemma_args_to_json(argstr):
-    s = argstr.replace('<|"|>', '"')                                  # Gemma string-quote token -> "
-    s = re.sub(r'<\|?[^>]*\|?>', '', s)                               # drop any stray special-token text
-    s = re.sub(r'([{\[,]\s*)([A-Za-z_][\w\-]*)(\s*:)', r'\1"\2"\3', s)  # quote bare keys
-    try: return json.loads(s)
-    except Exception: return {"_raw": argstr.replace('<|"|>', '"')}
+    """Parse Gemma's tool-arg syntax {k:<|"|>str<|"|>, k2:num, ...} -> dict. Strings are <|"|>-delimited
+    LITERALS, so we extract them verbatim (backslashes/quotes -- e.g. Windows paths like C:\\Users\\... --
+    stay intact); bare values (number/bool/null/array/object) parse as JSON. A naive ->'\"' swap + json.loads
+    breaks on backslashes and silently drops the args -- that's the opencode-on-Windows tool-call failure."""
+    s = argstr.strip()
+    if s.startswith('{'): s = s[1:]
+    if s.endswith('}'): s = s[:-1]
+    out, i, n, Q = {}, 0, len(s), len(_QUOTE)
+    while i < n:
+        while i < n and s[i] in ' ,\t\r\n': i += 1
+        c = s.find(':', i)
+        if c < 0: break
+        key = s[i:c].strip().strip('"').strip()
+        i = c + 1
+        while i < n and s[i] in ' \t': i += 1
+        if s[i:i + Q] == _QUOTE:                                  # quoted string literal
+            e = s.find(_QUOTE, i + Q)
+            if e < 0: e = n
+            out[key] = s[i + Q:e]; i = e + Q
+        else:                                                     # bare value, depth-aware up to a comma
+            d, e = 0, i
+            while e < n and (s[e] != ',' or d > 0):
+                if s[e] in '[{': d += 1
+                elif s[e] in ']}': d -= 1
+                e += 1
+            raw = s[i:e].strip(); i = e
+            try: out[key] = json.loads(raw.replace(_QUOTE, '"'))
+            except Exception: out[key] = raw.strip('"')
+    return out
 
 def _parse_tool_output(gen_ids):
     """gen_ids -> (content_text_or_None, [openai tool_call dicts])."""
@@ -141,10 +183,10 @@ def _parse_tool_output(gen_ids):
             if first is None: first = i
             j = i + 1
             while j < len(gen_ids) and gen_ids[j] != _TC_CLOSE: j += 1
-            span = E.tok.decode(gen_ids[i + 1:j], skip_special_tokens=False).replace('<|"|>', '"')
+            span = E.tok.decode(gen_ids[i + 1:j], skip_special_tokens=False)   # keep <|"|> markers intact
             m = re.match(r'\s*call:([A-Za-z_]\w*)\s*(\{.*\})?\s*$', span, re.S)
-            name = m.group(1) if m else span.strip()
-            args = _gemma_args_to_json(m.group(2)) if (m and m.group(2)) else {}
+            name = m.group(1) if m else span.replace(_QUOTE, '"').strip()
+            args = _normalize_paths(_gemma_args_to_json(m.group(2))) if (m and m.group(2)) else {}
             calls.append({"id": _uid("call"), "type": "function",
                           "function": {"name": name, "arguments": json.dumps(args)}})
             i = j + 1
