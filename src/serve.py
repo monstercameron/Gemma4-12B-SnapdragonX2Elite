@@ -245,12 +245,27 @@ def _run_tool(ids, max_new, temperature, top_p, top_k=0, min_p=0.0, rep_penalty=
             yield first
             yield from gen
 
+def _deser_tool_args(tool_calls):
+    """--- gist-derived fix (remove this fn + its call to revert) ---
+    OpenAI/Vercel-AI-SDK send tool_calls[].function.arguments as a JSON *string*; the Gemma template
+    then wraps it as invalid DSL `call:fn{{"k":"v"}}` (quoted keys/colons the model never saw) -> tool-arg
+    'collapse' on later turns. Deserialize string args -> dict so the template renders valid `{k:<|"|>v<|"|>}`."""
+    out = []
+    for tc in tool_calls or []:
+        tc = dict(tc); fn = dict(tc.get("function") or {})
+        a = fn.get("arguments")
+        if isinstance(a, str):
+            try: fn["arguments"] = json.loads(a)
+            except Exception: fn["arguments"] = {}
+        tc["function"] = fn; out.append(tc)
+    return out
+
 def _msg_dicts(messages):
     """Msg objects -> chat-template dicts, preserving tool_calls / tool results for the round-trip."""
     out = []
     for m in messages:
         d = {"role": m.role, "content": m.content if m.content is not None else ""}
-        if m.tool_calls: d["tool_calls"] = m.tool_calls
+        if m.tool_calls: d["tool_calls"] = _deser_tool_args(m.tool_calls)
         if m.tool_call_id: d["tool_call_id"] = m.tool_call_id
         if m.name: d["name"] = m.name
         out.append(d)
