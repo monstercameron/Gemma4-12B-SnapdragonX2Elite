@@ -536,8 +536,10 @@ def _loop_tail(buf, limit):
             return True
     return False
 
+_TH_OPEN, _TH_CLOSE = 100, 101   # <|channel> .. <channel|> : reasoning channel (for the think budget)
+
 def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_chunks=0, snap_chunks=0,
-             top_k=0, min_p=0.0, rep_penalty=1.0):
+             top_k=0, min_p=0.0, rep_penalty=1.0, think_budget=0):
     """Prefill `ids` then yield generated token ids one at a time (greedy or sampled).
     Prefix KV cache: `reuse_chunks` skips the first N prefill chunks (their KV is restored from the
     snapshot); `snap_chunks` snapshots the first N chunks' KV after prefilling them (for later reuse).
@@ -554,9 +556,16 @@ def generate(ids, max_new=256, temperature=0.0, top_p=1.0, stop_ids=(), reuse_ch
     logits = None
     for pos in range(nfull * MC, n): logits = forward(ids[pos], pos)           # tail + last via decode
     pos = n; recent = []; REPW = max(REPEAT_LIMIT + 8, 64)   # window for loop-guard + repetition penalty
+    in_think = False; think_n = 0
     for _ in range(max_new):
-        nxt = sample(logits, temperature, top_p, top_k, min_p, rep_penalty,
-                     recent if rep_penalty != 1.0 else None)
+        if think_budget and in_think and think_n >= think_budget:
+            nxt = _TH_CLOSE; in_think = False           # cap runaway thinking -> force <channel|>, get the answer
+        else:
+            nxt = sample(logits, temperature, top_p, top_k, min_p, rep_penalty,
+                         recent if rep_penalty != 1.0 else None)
+            if nxt == _TH_OPEN: in_think = True
+            elif nxt == _TH_CLOSE: in_think = False
+            elif in_think: think_n += 1
         if nxt in stop_ids: return
         yield nxt
         recent.append(nxt)

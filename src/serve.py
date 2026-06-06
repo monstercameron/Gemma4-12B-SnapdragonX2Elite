@@ -20,11 +20,12 @@ import vk_engine as E   # heavy: loads weights + records the Vulkan command buff
 MODEL_ID = "gemma-4-12b-it"
 DEFAULT_MAX_TOKENS = int(os.environ.get("GEMMA4_DEFAULT_MAX_TOKENS", "512"))
 # Reasoning channel (enable_thinking). ON, the model reasons before responding -> better tool selection
-# (e.g. realizing `bash` can mkdir), but it spends MANY tokens thinking first -- at ~13 tok/s that's tens
-# of seconds per turn (impractical as a default; "takes forever"). So DEFAULT OFF / opt-in via
-# GEMMA4_THINK=1. We strip the <|channel>thought<channel|> from output either way.
-# (To fully revert thinking support: delete this line + the enable_thinking= kwargs.)
-THINK = os.environ.get("GEMMA4_THINK", "0") == "1"
+# (e.g. realizing `bash` can mkdir). It spends tokens thinking first, so the engine force-closes the
+# thought channel after THINK_BUDGET tokens -- caps the runaway case (model rambling toward max_tokens,
+# e.g. minutes when a client sends a big max_tokens). NOTE: typical thinking is < budget, so the budget
+# bounds the worst case but not the per-turn overhead (~seconds at ~13 tok/s). GEMMA4_THINK=0 to disable.
+THINK = os.environ.get("GEMMA4_THINK", "1") != "0"
+THINK_BUDGET = int(os.environ.get("GEMMA4_THINK_BUDGET", "1000"))   # max reasoning tokens before forced answer
 
 # stop tokens: the model's own generation_config.eos_token_id is authoritative.
 # For this Gemma 4 build that's [1=<eos>, 106=<turn|>, 50] -- the turn delimiter is <turn|>, NOT
@@ -209,7 +210,8 @@ def _run(ids, max_new, temperature, top_p, stop_strs, top_k=0, min_p=0.0, rep_pe
     with _gen_lock:
         reuse, snap_arg = _cache_plan(ids)
         gen = E.generate(ids, max_new, temperature, top_p, STOP_IDS, reuse_chunks=reuse, snap_chunks=snap_arg,
-                         top_k=top_k, min_p=min_p, rep_penalty=rep_penalty)
+                         top_k=top_k, min_p=min_p, rep_penalty=rep_penalty,
+                         think_budget=(THINK_BUDGET if THINK else 0))
         _done = object(); first = next(gen, _done)   # runs prefill (incl. snapshot) + first decode token
         _cache_commit(ids, snap_arg)                  # snapshot now committed
 
@@ -244,7 +246,8 @@ def _run_tool(ids, max_new, temperature, top_p, top_k=0, min_p=0.0, rep_penalty=
         reuse, snap_arg = _cache_plan(ids)
         gen = E.generate(ids, max_new, temperature, top_p, set(STOP_IDS) | {_TC_CLOSE},
                          reuse_chunks=reuse, snap_chunks=snap_arg,
-                         top_k=top_k, min_p=min_p, rep_penalty=rep_penalty)
+                         top_k=top_k, min_p=min_p, rep_penalty=rep_penalty,
+                         think_budget=(THINK_BUDGET if THINK else 0))
         _done = object(); first = next(gen, _done)
         _cache_commit(ids, snap_arg)
         if first is not _done:
