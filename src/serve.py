@@ -19,11 +19,12 @@ import vk_engine as E   # heavy: loads weights + records the Vulkan command buff
 
 MODEL_ID = "gemma-4-12b-it"
 DEFAULT_MAX_TOKENS = int(os.environ.get("GEMMA4_DEFAULT_MAX_TOKENS", "512"))
-# Reasoning channel: the Gemma 4 template defaults enable_thinking=False (model answers immediately).
-# Turning it on lets the model reason before responding -> better tool selection (e.g. realizing `bash`
-# can mkdir), at the cost of extra decode tokens. We strip the <|channel>thought<channel|> from output.
-# GEMMA4_THINK=0 to disable. (To fully revert: delete this line + the enable_thinking= kwargs.)
-THINK = os.environ.get("GEMMA4_THINK", "1") != "0"
+# Reasoning channel (enable_thinking). ON, the model reasons before responding -> better tool selection
+# (e.g. realizing `bash` can mkdir), but it spends MANY tokens thinking first -- at ~13 tok/s that's tens
+# of seconds per turn (impractical as a default; "takes forever"). So DEFAULT OFF / opt-in via
+# GEMMA4_THINK=1. We strip the <|channel>thought<channel|> from output either way.
+# (To fully revert thinking support: delete this line + the enable_thinking= kwargs.)
+THINK = os.environ.get("GEMMA4_THINK", "0") == "1"
 
 # stop tokens: the model's own generation_config.eos_token_id is authoritative.
 # For this Gemma 4 build that's [1=<eos>, 106=<turn|>, 50] -- the turn delimiter is <turn|>, NOT
