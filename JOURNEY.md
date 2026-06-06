@@ -672,6 +672,39 @@ optimizations target.
 attention K-load coalescing fix (which also lifted prefill). Everything else is either marginal,
 non-speed, or needs a major kernel; the benchmark-gated loop kept exactly the change that earned it.
 
+## Phase 23 — Vulkan vs D3D12 on the Adreno: would DirectX be faster? (measured)
+
+"Would DirectX kernels be faster?" The bottleneck is the *silicon* (bandwidth for decode, matrix cores
+for prefill), not the API — but instead of asserting, measured it. `benchmarks/bench_backend.py` runs the
+**same WGSL kernel through wgpu's Vulkan vs D3D12 backends** (`WGPU_BACKEND_TYPE`), which isolates the
+*driver* on the Adreno X2-90 / Windows-ARM64.
+
+| Kernel | Vulkan | D3D12 | read |
+|---|---|---|---|
+| pure streaming read | ~99 GB/s | ~99 GB/s | **equal at full clocks** (thermal-noisy run-to-run) |
+| int4 GEMV (decode pattern) | **~22.4 GB/s** | ~18.6 GB/s | **Vulkan +~20%, stable across runs** |
+
+**Findings:**
+- **D3D12 is stable** on this Windows-ARM64 Adreno — it initializes and runs cleanly every time (the
+  "is the driver even usable" question: yes).
+- **Pure memory bandwidth is a wash** — at full clocks both backends hit the same ~99 GB/s ceiling. That
+  *confirms* the core claim: the bandwidth wall is the silicon; the API can't beat it. (An early run
+  showed a false 55-vs-45 gap — pure thermal ramp / contention, gone on re-run.)
+- **But the real int4-GEMV kernel runs ~20% faster on Vulkan** (22.4 vs 18.6 GB/s, consistent). Decode
+  isn't *pure* bandwidth — it interleaves int4-unpack + scale + accumulate, and **Qualcomm's Adreno
+  driver generates better code for that on the Vulkan path** (it's their Vulkan-native lineage from
+  Android). So a D3D12 port would *regress* decode, not help.
+
+**Caveats (honest):** measured through wgpu (fair — same wrapper both sides — but absolute GB/s sit below
+our raw-Vulkan engine's tuned `uvec2` GEMV); the streaming-read number is thermal-noisy so the GEMV is the
+reliable signal; and wgpu/WebGPU can't expose cooperative matrix, so the **prefill / matrix-core path is
+untested** here — but a Vulkan-native driver winning the GEMV makes it very unlikely D3D12 would *gain* on
+prefill (where it would more likely lose the coopmat 2× entirely).
+
+**Verdict:** Vulkan is the right call on this hardware — stable parity on raw bandwidth, **~20% ahead on
+the kernel that counts**, untestable-but-likely-better on the matrix cores, and portable to Linux on top.
+DirectX would be a rewrite for a regression.
+
 ---
 
 ## Final standings
